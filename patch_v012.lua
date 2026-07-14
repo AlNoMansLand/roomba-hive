@@ -18,23 +18,44 @@ local h = assert(fs.open(path, "r"))
 local source = h.readAll()
 h.close()
 
+local function whitespacePattern(text)
+    local parts = {}
+    local i = 1
+    while i <= #text do
+        local c = text:sub(i, i)
+        if c:match("%s") then
+            while i <= #text and text:sub(i, i):match("%s") do i = i + 1 end
+            parts[#parts + 1] = "%s+"
+        else
+            if c:match("[%^%$%(%)%%%.%[%]%*%+%-%?]") then
+                parts[#parts + 1] = "%" .. c
+            else
+                parts[#parts + 1] = c
+            end
+            i = i + 1
+        end
+    end
+    return table.concat(parts)
+end
+
 local function replaceOnce(old, new, label)
-    local startPos, endPos = source:find(old, 1, true)
-    if not startPos then
-        error("Patch failed (" .. label .. "): expected source text was not found.", 0)
+    local pattern = whitespacePattern(old)
+    local firstStart, firstEnd = source:find(pattern)
+    if not firstStart then
+        error("Patch failed (" .. label .. "): expected source structure was not found.", 0)
     end
-    if source:find(old, endPos + 1, true) then
-        error("Patch failed (" .. label .. "): source text appeared more than once.", 0)
+    if source:find(pattern, firstEnd + 1) then
+        error("Patch failed (" .. label .. "): source structure appeared more than once.", 0)
     end
-    source = source:sub(1, startPos - 1) .. new .. source:sub(endPos + 1)
+    source = source:sub(1, firstStart - 1) .. new .. source:sub(firstEnd + 1)
 end
 
 local function replacePattern(pattern, new, label)
-    local count
-    source, count = source:gsub(pattern, new, 1)
-    if count ~= 1 then
+    local firstStart, firstEnd = source:find(pattern)
+    if not firstStart then
         error("Patch failed (" .. label .. "): flexible source pattern was not found.", 0)
     end
+    source = source:sub(1, firstStart - 1) .. new .. source:sub(firstEnd + 1)
 end
 
 if role == "controller" then
