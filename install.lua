@@ -51,7 +51,7 @@ if not fs.exists("/roomba") then fs.makeDir("/roomba") end
 
 local function download(url, path)
     print("Downloading " .. path .. "...")
-    local response, err = http.get(url .. "?v=012b")
+    local response, err = http.get(url .. "?v=012c")
     if not response then fail("Download failed: " .. tostring(err)) end
     local body = response.readAll()
     response.close()
@@ -67,7 +67,7 @@ end
 
 term.clear()
 term.setCursorPos(1, 1)
-print("Roomba Hive Installer v0.1.2b")
+print("Roomba Hive Installer v0.1.2c")
 print("============================")
 print("Role: " .. role)
 print("")
