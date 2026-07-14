@@ -1,101 +1,78 @@
-# Roomba Hive v0.1.1
+# Roomba Hive v0.1.2 upgrade
 
-A multi-turtle CC:Tweaked excavator based on the proven single-turtle `roomba.lua` calibration and sweep design.
+Upload these three files to the root of your GitHub repository:
 
-## Status
+- `install.lua` (replace the existing installer)
+- `patch_v012.lua` (new file)
+- `roomba_reset.lua` (new file)
 
-This is an early implementation build. Test it in a small disposable quarry before trusting it with a large excavation. The package has not yet been executed inside Minecraft in this environment.
+Keep the existing `roomba_controller.lua`, `roomba_worker.lua`,
+`startup_controller.lua`, and `startup_worker.lua`. The v0.1.2 installer
+downloads the existing v0.1.1 source and applies the patch automatically.
 
-## v0.1.1
-
-- Dock detection is blocked while a job is running or paused, so active assignments cannot be erased.
-- The controller now tracks remembered dock assignments separately from current physical occupancy.
-- Workers restore their saved dock label after reboot and include the saved dock in hello and heartbeat messages.
-- The controller accepts a worker's valid saved assignment unless that dock belongs to another active worker.
-
-## Required base layout
-
-Logical center is the Advanced Computer at `0,0,0`.
-
-- `0,1,0`: wireless or ender modem attached to the controller.
-- `0,3,0`: shared fuel inventory containing fuel only.
-- Layer 1 is `Y=-1`.
-
-Workers at Y=0:
-
-- North: `0,0,-1`, facing north.
-- East: `1,0,0`, facing east.
-- South: `0,0,1`, facing south.
-- West: `-1,0,0`, facing west.
-
-Each worker has:
-
-- An output inventory directly above it at Y=1.
-- Its extraction pipe above that at Y=2.
-- A clear shaft directly below it.
-- A clear block one step outward, and a clear vertical route from there to Y=3.
-- A mining tool upgrade and wireless/ender modem upgrade.
-- Slot 1 reserved for fuel.
-
-## Installation
-
-Upload these files to a raw-file host such as GitHub:
-
-- `install.lua`
-- `roomba_controller.lua`
-- `roomba_worker.lua`
-- `startup_controller.lua`
-- `startup_worker.lua`
-
-Edit `BASE_URL` inside `install.lua` to the directory containing those raw files.
+## Reinstall/update
 
 Controller:
 
 ```text
-wget run <raw install.lua URL> controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=012 controller
 ```
 
-Every worker:
+Each worker:
 
 ```text
-wget run <raw install.lua URL> worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=012 worker
 ```
 
-The installer creates `/startup.lua`, so the program launches after every reboot.
+The installer preserves the old installed program as `.old` and the patcher
+also keeps a `.v011` backup.
 
-## First test
+## Factory reset
 
-1. Build the base and place one worker, not all four.
-2. Install controller and worker.
-3. Start both devices.
-4. On the controller press `D` to detect docks.
-5. Build a small closed outline on Y=-1, with a clear interior.
-6. Press `C` to calibrate and save it.
-7. Press `J`, choose one or two layers, and supervise the entire run.
-8. Add the remaining workers only after the single-worker test succeeds.
+After v0.1.2 is installed, run this single command on any controller or worker:
 
-## Hazard behavior
+```text
+roomba-reset
+```
 
-- Water: the worker continues; the excavation may flood.
-- Lava: current v0.1.1 does not yet have reliable fluid-source detection. Supervise lava-prone jobs.
-- Entity: wait 5 seconds, attack exactly once, retry once, then stop and report.
-- Inventories, computers and turtles: protected and never deliberately mined.
-- Falling blocks: repeatedly mined up to a safety limit.
-- Undiggable blocks: stop and report.
+Alternatively, without installing first:
 
-## Important v0.1.1 limitations
+```text
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=012 reset
+```
 
-- Fixed contiguous layer sections are assigned to up to four docked workers.
-- Do not add extra workers to an occupied shaft.
-- Worker recovery data is written locally, but automatic mid-route resume after a reboot is not enabled yet. A reboot underground should be treated as manual recovery.
-- Normal wireless modems may lose range underground. Ender modems are strongly recommended for deep jobs.
-- The shared fuel chest must contain valid turtle fuel only.
-- The pipe system is external to CC:Tweaked and is not controlled by this program.
-- The controller-side orientation assumes its `front/right/back/left` correspond to north/east/south/west. Place and orient the controller accordingly.
+A factory reset deletes `/roomba`, `/startup.lua`, the label, maps, and state.
 
-## Files
+## v0.1.2 behavior
 
-- `roomba_controller.lua`: controller UI, dock detection, map storage, sections, locks and worker status.
-- `roomba_worker.lua`: docking, calibration, route generation, mining, unloading and refuelling.
-- `install.lua`: one-command installer.
-- `original_roomba.lua`: original working single-turtle program retained as a reference/fallback.
+### Pause
+
+Pause is now read while a worker is actively mining, rather than only while the
+worker is idle. The turtle stops at the next safe movement boundary, sends
+paused heartbeats, and resumes from the same route position.
+
+### Abort
+
+Press `A` on the controller and type `ABORT`.
+
+A live worker:
+
+1. Stops at the next safe movement boundary.
+2. Uses already carved cells to return to the center.
+3. Returns to its assigned shaft.
+4. Ascends and unloads slots 2-16.
+5. Releases the shared fuel lock if needed.
+6. Reports that it aborted and remains docked.
+
+Abort cannot control a turtle whose Lua program has already crashed or exited.
+
+### Fuel slot protection
+
+- Slot 1 remains fuel-only.
+- Five fuel items are always preserved in slot 1.
+- Once slot 1 reaches five items, the turtle returns to refuel.
+- Digging selects slots 2-16 first.
+- The turtle refuses to dig when storage slots 2-16 cannot accept items.
+- Unloading still leaves slot 1 untouched.
+
+Use solid stackable fuel such as coal or charcoal.
