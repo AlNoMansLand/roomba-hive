@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.1.0
+-- Roomba Hive Worker v0.1.1
 -- Mining turtle requirements: mining tool + wireless/ender modem.
 
-local VERSION = "0.1.0"
+local VERSION = "0.1.1"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -47,12 +47,18 @@ local pos=state.pos or {x=0,y=0,z=0,dir=NORTH}
 local interior,bounds,carved,wall={},nil,{},{}
 local paused=false
 
+local function restoreComputerLabel()
+ if dock and dockInfo[dock] then os.setComputerLabel("Roomba "..dock.." #"..os.getComputerID()) end
+end
+restoreComputerLabel()
+
 local function persist()
  state.controller=controller;state.dock=dock;state.pos=pos;saveTable(STATE_FILE,state)
 end
 local function send(kind,data)
  if not controller then return false end
  data=data or {};data.type=kind;data.version=VERSION
+ if (kind=="hello" or kind=="heartbeat") and data.dock==nil then data.dock=dock end
  return rednet.send(controller,data,PROTOCOL)
 end
 local function reportError(message,extra)
@@ -328,7 +334,7 @@ local function discoverController()
  while not controller do
   local id=rednet.lookup(PROTOCOL,HOSTNAME)
   if id then controller=id;persist();break end
-  rednet.broadcast({type="hello",version=VERSION,status=state.status},PROTOCOL);sleep(2)
+  rednet.broadcast({type="hello",version=VERSION,status=state.status,dock=dock},PROTOCOL);sleep(2)
  end
  send("hello",{status=state.status,dock=dock,fuel=fuelLevel()})
 end
@@ -353,7 +359,7 @@ local function commandLoop()
   elseif proto==PROTOCOL and type(msg)=="table" then
    if msg.type=="dock_probe_begin" then controller=msg.controller;persist()
    elseif msg.type=="dock_assigned" then
-    controller=msg.controller;dock=msg.dock;local d=dockInfo[dock];pos={x=d.x,y=0,z=d.z,dir=d.out};state.status="docked";persist();os.setComputerLabel("Roomba "..dock.." #"..os.getComputerID());send("hello",{status="docked",dock=dock,fuel=fuelLevel()})
+    controller=msg.controller;dock=msg.dock;local d=dockInfo[dock];pos={x=d.x,y=0,z=d.z,dir=d.out};state.status="docked";persist();restoreComputerLabel();send("hello",{status="docked",dock=dock,fuel=fuelLevel()})
    elseif msg.type=="calibrate" then if not dock then reportError("Worker is not dock-assigned.") end;runCalibration(msg.name)
    elseif msg.type=="start_section" then if not dock then reportError("Worker is not dock-assigned.") end;runSection(msg)
    elseif msg.type=="pause" then paused=true
