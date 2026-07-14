@@ -51,7 +51,7 @@ if not fs.exists("/roomba") then fs.makeDir("/roomba") end
 
 local function download(url, path)
     print("Downloading " .. path .. "...")
-    local response, err = http.get(url .. "?v=012")
+    local response, err = http.get(url .. "?v=012b")
     if not response then fail("Download failed: " .. tostring(err)) end
     local body = response.readAll()
     response.close()
@@ -67,7 +67,7 @@ end
 
 term.clear()
 term.setCursorPos(1, 1)
-print("Roomba Hive Installer v0.1.2")
+print("Roomba Hive Installer v0.1.2b")
 print("============================")
 print("Role: " .. role)
 print("")
@@ -79,10 +79,11 @@ end
 download(BASE_URL .. "/patch_v012.lua", "/roomba/patch_v012.lua")
 download(BASE_URL .. "/roomba_reset.lua", "/roomba-reset.lua")
 
-local ok, err = pcall(function()
-    shell.run("/roomba/patch_v012.lua", role)
+local ok, result = pcall(function()
+    return shell.run("/roomba/patch_v012.lua", role)
 end)
-if not ok then fail("v0.1.2 patch failed: " .. tostring(err)) end
+if not ok then fail("v0.1.2 patch crashed: " .. tostring(result)) end
+if result == false then fail("v0.1.2 patch reported a failure. The old program was left available as .old.") end
 
 if role == "controller" then
     os.setComputerLabel("Roomba Hive Controller")
