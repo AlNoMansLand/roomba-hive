@@ -1,4 +1,4 @@
--- Roomba Hive one-command installer v0.1.0
+-- Roomba Hive one-command installer v0.1.1
 -- Usage: wget run <raw-install-url> controller
 --        wget run <raw-install-url> worker
 
