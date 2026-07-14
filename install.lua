@@ -6,7 +6,7 @@ local args = { ... }
 local role = args[1] and args[1]:lower() or nil
 
 -- Change this after uploading the package to GitHub or another raw-file host.
-local BASE_URL = "https://raw.githubusercontent.com/REPLACE_ME/roomba-hive/main"
+local BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
 
 local files = {
     controller = {
@@ -29,9 +29,6 @@ if not files[role] then
 end
 if not http then
     fail("HTTP is disabled. Enable it in the CC:Tweaked server/client configuration.")
-end
-if BASE_URL:find("REPLACE_ME", 1, true) then
-    fail("Installer BASE_URL has not been configured by the publisher yet.")
 end
 
 if not fs.exists("/roomba") then fs.makeDir("/roomba") end
