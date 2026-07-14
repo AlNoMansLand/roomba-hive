@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.2
+
+- Removed per-block inventory snapshots and stack transfers.
+- Restored fast native CC:Tweaked item stacking by keeping a storage slot selected.
+- Added safe empty-fuel-station handling: workers return to dock and show RESTOCK FUEL STATION.
+- Allowed remaining work to be restarted from the Workers menu after the fuel station is restocked.
+
 ## v0.2.1
 
 - Replaced the static worker startup text with a live task, progress, fuel, storage, position, and error panel.

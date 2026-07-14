@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.2.1
+-- Roomba Hive Worker v0.2.2
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.2.1"
+local VERSION = "0.2.2"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -16,9 +16,10 @@ local FUEL_MARGIN = 96
 local POSITION_SAVE_INTERVAL = 24
 local MAX_FALLING_DIGS = 32
 local MAX_CALIBRATION_STEPS = 100000
-local INVENTORY_CHECK_INTERVAL = 16
+local INVENTORY_CHECK_INTERVAL = 6
 local MOVE_RETRY_DELAY = 0.4
 local ABORT_SIGNAL = "__ROOMBA_ABORT__"
+local FUEL_STATION_EMPTY_SIGNAL = "__ROOMBA_FUEL_STATION_EMPTY__"
 
 local NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
 local dirNames = { [NORTH] = "north", [EAST] = "east", [SOUTH] = "south", [WEST] = "west" }
@@ -109,6 +110,7 @@ local STATUS_LABELS = {
     returning_by_command = "Returning by command",
     refueling = "Refueling",
     waiting_for_fuel = "Waiting for fuel in chest",
+    fuel_station_empty = "RESTOCK FUEL STATION",
     waiting_fuel_lock = "Waiting for shared fuel station",
     paused = "Paused safely",
     blocked_waiting = "Blocked - waiting for clearance",
@@ -172,6 +174,7 @@ local function renderWorkerScreen(force)
 
     local statusText = STATUS_LABELS[state.status] or tostring(state.status or "unknown")
     local statusColor = state.status == "error" and colors.red
+        or state.status == "fuel_station_empty" and colors.red
         or state.status == "blocked_waiting" and colors.orange
         or state.status == "paused" and colors.yellow
         or colors.lime
@@ -282,6 +285,8 @@ local function isUnlimitedFuel()
     return fuelLevel() == "unlimited"
 end
 
+local collectionSlot = FIRST_STORAGE_SLOT
+
 local function findEmptyStorageSlot()
     for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
         if turtle.getItemCount(slot) == 0 then return slot end
@@ -289,80 +294,30 @@ local function findEmptyStorageSlot()
     return nil
 end
 
-local function sameStack(left, right)
-    if not left or not right then return false end
-    return left.name == right.name
-        and left.damage == right.damage
-        and left.nbt == right.nbt
-end
-
-local function compactStorage()
-    local previouslySelected = turtle.getSelectedSlot()
-
-    for source = LAST_STORAGE_SLOT, FIRST_STORAGE_SLOT, -1 do
-        local sourceDetail = turtle.getItemDetail(source)
-        if sourceDetail then
-            for target = FIRST_STORAGE_SLOT, source - 1 do
-                local targetDetail = turtle.getItemDetail(target)
-                if sameStack(sourceDetail, targetDetail) and turtle.getItemSpace(target) > 0 then
-                    turtle.select(source)
-                    turtle.transferTo(target)
-                    if turtle.getItemCount(source) == 0 then break end
-                    sourceDetail = turtle.getItemDetail(source)
-                end
-            end
-        end
-    end
-
-    if previouslySelected >= FUEL_SLOT and previouslySelected <= LAST_STORAGE_SLOT then
-        turtle.select(previouslySelected)
-    else
-        turtle.select(FUEL_SLOT)
-    end
-end
-
-local function storageSnapshot()
-    local snapshot = {}
-    for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
-        snapshot[slot] = turtle.getItemCount(slot)
-    end
-    return snapshot
-end
-
+-- Keep one storage slot selected and let CC:Tweaked's normal collection logic
+-- stack compatible drops. We only switch slots when the current collection
+-- slot is full, avoiding an inventory scan and transfer after every block.
 local function selectCollectionSlot()
-    local selected = turtle.getSelectedSlot()
-    if selected >= FIRST_STORAGE_SLOT
-        and selected <= LAST_STORAGE_SLOT
-        and turtle.getItemSpace(selected) > 0 then
-        return selected
+    if collectionSlot < FIRST_STORAGE_SLOT or collectionSlot > LAST_STORAGE_SLOT then
+        collectionSlot = FIRST_STORAGE_SLOT
     end
 
-    compactStorage()
-    local slot = findEmptyStorageSlot()
-    if not slot then return nil end
-    turtle.select(slot)
-    return slot
+    if turtle.getItemSpace(collectionSlot) <= 0 then
+        local empty = findEmptyStorageSlot()
+        if not empty then return nil end
+        collectionSlot = empty
+    end
+
+    if turtle.getSelectedSlot() ~= collectionSlot then turtle.select(collectionSlot) end
+    return collectionSlot
 end
 
-local function followCollectedItem(before)
-    local bestSlot = nil
-    local bestIncrease = 0
-
+local function countEmptyStorageSlots()
+    local count = 0
     for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
-        local increase = turtle.getItemCount(slot) - (before[slot] or 0)
-        if increase > bestIncrease and turtle.getItemSpace(slot) > 0 then
-            bestIncrease = increase
-            bestSlot = slot
-        end
+        if turtle.getItemCount(slot) == 0 then count = count + 1 end
     end
-
-    if bestSlot then turtle.select(bestSlot) end
-end
-
-local function hasEmptyStorageSlot()
-    if findEmptyStorageSlot() then return true end
-    compactStorage()
-    return findEmptyStorageSlot() ~= nil
+    return count
 end
 
 local function validateFuelSlot()
@@ -372,10 +327,6 @@ local function validateFuelSlot()
     if turtle.refuel(0) then return true end
 
     local destination = findEmptyStorageSlot()
-    if not destination then
-        compactStorage()
-        destination = findEmptyStorageSlot()
-    end
     if not destination then
         reportError("Slot 1 contains a non-fuel item and storage slots 2-16 are occupied.")
     end
@@ -545,10 +496,8 @@ local function forwardMine()
                 reportError("Protected block or inventory in mining route: " .. tostring(data and data.name))
             end
             if not selectCollectionSlot() then return false, "storage full", false end
-            local before = storageSnapshot()
             local dug, reason = turtle.dig()
             if not dug then reportError("Unable to dig block: " .. tostring(reason), { block = data and data.name }) end
-            followCollectedItem(before)
             if turtle.forward() then
                 advancePosition()
                 carved[key(pos.x, pos.z)] = true
@@ -610,10 +559,8 @@ local function downDig()
             reportError("Protected block below the shaft.")
         end
         if not selectCollectionSlot() then reportError("Storage slots 2-16 are occupied before shaft digging.") end
-        local before = storageSnapshot()
         local dug, reason = turtle.digDown()
         if not dug then reportError("Cannot dig shaft downward: " .. tostring(reason)) end
-        followCollectedItem(before)
         if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     else
         sleep(5)
@@ -801,7 +748,6 @@ local function goCenterForLayer(layer)
 end
 
 local function dumpUp(allowIncomplete)
-    compactStorage()
     local allUnloaded = true
     for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
         while turtle.getItemCount(slot) > 0 do
@@ -822,7 +768,8 @@ local function dumpUp(allowIncomplete)
             end
         end
     end
-    turtle.select(FUEL_SLOT)
+    collectionSlot = FIRST_STORAGE_SLOT
+    turtle.select(collectionSlot)
     return allUnloaded
 end
 
@@ -890,6 +837,34 @@ local function requestFuelLock()
     return true
 end
 
+local function returnFromFuelStation(info)
+    -- The worker never mines on this route, so it is safe to consume reserve
+    -- items if necessary to guarantee enough movement fuel to get home.
+    ensureEmergencyFuel(5)
+    turnAround()
+    local moved, reason = forwardOpen()
+    if not moved then releaseFuelLock(); reportError("Cannot leave fuel chest: " .. tostring(reason)) end
+    downOpen(); downOpen(); downOpen()
+    turnAround()
+    moved, reason = forwardOpen()
+    if not moved then releaseFuelLock(); reportError("Cannot return to dock from fuel route: " .. tostring(reason)) end
+    turnTo(info.out)
+    releaseFuelLock()
+end
+
+local function stopForEmptyFuelStation(info)
+    returnFromFuelStation(info)
+    state.error = "Restock the shared fuel station, then restart this worker's remaining work."
+    setStatus("fuel_station_empty", "RESTOCK FUEL STATION")
+    send("fuel_station_empty", {
+        message = state.error,
+        fuel = fuelLevel(),
+        fuelItems = turtle.getItemCount(FUEL_SLOT),
+        position = pos,
+    })
+    error(FUEL_STATION_EMPTY_SIGNAL, 0)
+end
+
 local function refuelAtStation(required)
     if isUnlimitedFuel() then return true end
     local info = dockInfo[dock]
@@ -898,10 +873,9 @@ local function refuelAtStation(required)
     end
     if not requestFuelLock() then return false end
 
-    -- A low-item trigger may happen with little movement fuel remaining. Consume
-    -- emergency reserve only when necessary to reach the station, while keeping
-    -- at least one item in slot 1 so mined blocks still cannot occupy it.
-    ensureEmergencyFuel(5)
+    -- Reserve enough movement fuel for the full trip to the station and back,
+    -- even when the station turns out to be empty.
+    ensureEmergencyFuel(10)
     setStatus("refueling", "Taking fuel from the shared fuel chest")
     turnTo(info.out)
     local moved, reason = forwardOpen()
@@ -914,35 +888,56 @@ local function refuelAtStation(required)
     validateFuelSlot()
     turtle.select(FUEL_SLOT)
     local target = math.max(required or 0, FUEL_TARGET)
-    while fuelLevel() < target or turtle.getItemCount(FUEL_SLOT) <= FUEL_ITEM_RESERVE do
-        if abortRequested then break end
-        if turtle.getItemCount(FUEL_SLOT) <= FUEL_ITEM_RESERVE then
-            if not turtle.suck(64) then
-                setStatus("waiting_for_fuel", "Fuel chest is empty; add coal or charcoal")
-                sleep(1)
-            else
-                validateFuelSlot()
-                setStatus("refueling", "Taking fuel from the shared fuel chest")
-            end
-        elseif fuelLevel() < target then
+
+    while not abortRequested do
+        while fuelLevel() < target and turtle.getItemCount(FUEL_SLOT) > FUEL_ITEM_RESERVE do
             if not turtle.refuel(1) then
                 releaseFuelLock()
-                reportError("Fuel chest supplied a non-fuel item. Fuel chest must contain fuel only.")
+                reportError("Slot 1 contains an invalid fuel item.")
             end
         end
+
+        if fuelLevel() >= target and turtle.getItemCount(FUEL_SLOT) > FUEL_ITEM_RESERVE then
+            break
+        end
+
+        -- Pull the next fuel stack into an empty mining-storage slot first.
+        -- This allows the station to switch between coal, charcoal, or another
+        -- valid fuel without putting that new stack into an unrelated slot.
+        local bufferSlot = findEmptyStorageSlot()
+        if not bufferSlot then
+            releaseFuelLock()
+            reportError("No empty storage slot was available to receive fuel from the station.")
+        end
+        turtle.select(bufferSlot)
+        if not turtle.suck(64) then stopForEmptyFuelStation(info) end
+        if not turtle.refuel(0) then
+            turtle.drop()
+            releaseFuelLock()
+            reportError("Fuel chest supplied a non-fuel item. Fuel chest must contain fuel only.")
+        end
+
+        -- Fuel was successfully found. Consume the old five-item reserve to
+        -- free slot 1, then move the fresh fuel stack into the protected slot.
+        turtle.select(FUEL_SLOT)
+        while turtle.getItemCount(FUEL_SLOT) > 0 do
+            if not turtle.refuel(1) then
+                releaseFuelLock()
+                reportError("Slot 1 contains an invalid fuel item.")
+            end
+        end
+        turtle.select(bufferSlot)
+        if not turtle.transferTo(FUEL_SLOT) then
+            releaseFuelLock()
+            reportError("Could not move station fuel into protected slot 1.")
+        end
+        turtle.select(FUEL_SLOT)
+        setStatus("refueling", "Taking fuel from the shared fuel chest")
     end
 
-    ensureEmergencyFuel(5)
-    turnAround()
-    moved, reason = forwardOpen()
-    if not moved then releaseFuelLock(); reportError("Cannot leave fuel chest: " .. tostring(reason)) end
-    downOpen(); downOpen(); downOpen()
-    turnAround()
-    moved, reason = forwardOpen()
-    if not moved then releaseFuelLock(); reportError("Cannot return to dock from fuel route: " .. tostring(reason)) end
-    turnTo(info.out)
-    releaseFuelLock()
-    setStatus("docked", "Docked, unloaded, and ready")
+    returnFromFuelStation(info)
+    state.error = nil
+    setStatus("docked", "Docked, refueled, and ready")
     return not abortRequested
 end
 
@@ -1058,12 +1053,6 @@ local function excavateLayer(layer, route, totalMoves)
         for _ = 1, run.count do
             safePoint("mining")
 
-            if not hasEmptyStorageSlot() then
-                local checkpointX, checkpointZ = pos.x, pos.z
-                unloadAndReturnToCheckpoint(layer, checkpointX, checkpointZ)
-                turnTo(run.direction)
-            end
-
             local moved, reason, dug = forwardMine()
             if not moved and reason == "storage full" then
                 local checkpointX, checkpointZ = pos.x, pos.z
@@ -1081,9 +1070,18 @@ local function excavateLayer(layer, route, totalMoves)
                 renderWorkerScreen(false)
             end
 
-            if dug or inventoryChecks >= INVENTORY_CHECK_INTERVAL then
-                if inventoryChecks >= INVENTORY_CHECK_INTERVAL then compactStorage() end
+            if inventoryChecks >= INVENTORY_CHECK_INTERVAL then
                 inventoryChecks = 0
+
+                -- A full inventory scan is done only periodically. If six or
+                -- fewer empty slots remain, unload now; at most six new stack
+                -- types can appear before the next check, so collection stays safe.
+                if countEmptyStorageSlots() <= INVENTORY_CHECK_INTERVAL then
+                    local checkpointX, checkpointZ = pos.x, pos.z
+                    unloadAndReturnToCheckpoint(layer, checkpointX, checkpointZ)
+                    turnTo(run.direction)
+                end
+
                 local reserve = reserveForDock(layer)
                 if not isUnlimitedFuel() and (fuelLevel() < reserve or fuelItemsLow()) then
                     local checkpointX, checkpointZ = pos.x, pos.z
@@ -1382,7 +1380,9 @@ local function commandLoop()
                     fuelLockGranted = false
                     local ok, err = runManagedTask(function() runSectionWork(message) end)
                     if not ok then
-                        if err == ABORT_SIGNAL then
+                        if err == FUEL_STATION_EMPTY_SIGNAL then
+                            -- The worker is already safely docked and waiting for restock.
+                        elseif err == ABORT_SIGNAL then
                             local messageType = parkRequested and "worker_parked" or "worker_aborted"
                             local note = parkRequested and "returned by worker command" or nil
                             local abortOk, abortErr = pcall(function() performAbort(note, messageType) end)
@@ -1418,7 +1418,9 @@ local function commandLoop()
                 else
                     local ok, err = runManagedTask(function() recoverAndRetry(message) end)
                     if not ok then
-                        if err == ABORT_SIGNAL then
+                        if err == FUEL_STATION_EMPTY_SIGNAL then
+                            -- The worker is already safely docked and waiting for restock.
+                        elseif err == ABORT_SIGNAL then
                             local messageType = parkRequested and "worker_parked" or "worker_aborted"
                             local abortOk, abortErr = pcall(function() performAbort("recovery interrupted", messageType) end)
                             if not abortOk then printError(abortErr) end

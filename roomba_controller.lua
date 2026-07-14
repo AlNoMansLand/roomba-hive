@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.2.1
+-- Roomba Hive Controller v0.2.2
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.2.1"
+local VERSION = "0.2.2"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -609,6 +609,16 @@ local function handleMessage(sender, message)
             recoverable = true,
         }
 
+    elseif message.type == "fuel_station_empty" then
+        worker.status = "fuel_station_empty"
+        worker.fuel = message.fuel or worker.fuel
+        worker.position = message.position or worker.position
+        worker.error = {
+            message = message.message or "RESTOCK FUEL STATION, then restart remaining work.",
+            position = message.position,
+        }
+        if state.fuelLock == sender then state.fuelLock = nil end
+
     elseif message.type == "worker_error" then
         worker.status = "ERROR: " .. tostring(message.message)
         worker.error = message
@@ -708,6 +718,11 @@ local function workerDetails(worker)
     print("Fuel: " .. tostring(worker.fuel or "?"))
     if worker.position then print("Position: " .. textutils.serialize(worker.position)) end
     if worker.progress and worker.total then print("Progress: " .. tostring(worker.progress) .. "/" .. tostring(worker.total)) end
+    if worker.status == "fuel_station_empty" then
+        print("")
+        print("RESTOCK FUEL STATION")
+        print("After adding fuel, choose option 6 to continue remaining work.")
+    end
     if worker.error then
         print("")
         print("Last problem:")
@@ -720,7 +735,7 @@ local function workerDetails(worker)
     print("3) Return to dock and stop")
     print("4) Pause this worker")
     print("5) Resume this worker")
-    print("6) Restart remaining work from dock")
+    print("6) Restart remaining work from dock / after fuel restock")
     print("7) Clear displayed error")
     print("8) Forget this worker record")
     print("0) Back")
@@ -787,7 +802,10 @@ local function manageWorker(worker)
             if not assignment then
                 print(err)
                 sleep(2)
-            elseif worker.status ~= "docked" and worker.status ~= "parked" and worker.status ~= "aborted" then
+            elseif worker.status ~= "docked"
+                and worker.status ~= "parked"
+                and worker.status ~= "aborted"
+                and worker.status ~= "fuel_station_empty" then
                 print("Use Recover and retry unless the worker is physically docked.")
                 sleep(2)
             else

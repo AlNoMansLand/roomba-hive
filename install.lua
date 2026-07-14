@@ -1,12 +1,12 @@
--- Roomba Hive direct installer v0.2.1
+-- Roomba Hive direct installer v0.2.2
 -- Usage:
 --   wget run <raw install.lua URL> controller
 --   wget run <raw install.lua URL> worker
 --   wget run <raw install.lua URL> reset
 
-local VERSION = "0.2.1"
+local VERSION = "0.2.2"
 local BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
-local CACHE_TAG = "021"
+local CACHE_TAG = "022"
 local args = { ... }
 local role = args[1] and args[1]:lower() or nil
 

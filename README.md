@@ -1,10 +1,10 @@
-# Roomba Hive v0.2.1
+# Roomba Hive v0.2.2
 
 A coordinated CC:Tweaked excavation system for one Advanced Computer and up to four mining turtles.
 
 This is a complete-source release. The installer downloads finished controller and worker programs directly; it does not use a runtime patcher.
 
-## v0.2.1 highlights
+## v0.2.2 highlights
 
 - The **Workers** screen is now interactive: select an individual turtle to inspect and control it.
 - Recover and retry a selected worker after an error without restarting the other workers.
@@ -15,6 +15,8 @@ This is a complete-source release. The installer downloads finished controller a
 - ComputerCraft turtles/computers blocking a shaft now produce `blocked_waiting` instead of a hard crash. The worker checks every second and automatically continues when the obstruction is removed.
 - Turtle labels use physical controller sides: **front, right, back, left**. They no longer pretend those sides are real world compass directions.
 - Fixed worker turn tracking so a right turn updates the logical direction exactly once.
+- Removed the per-block inventory snapshot/transfer routine, restoring fast native stacking.
+- Empty fuel stations no longer trap workers: they return to dock and display **RESTOCK FUEL STATION**.
 
 ## Included features
 
@@ -31,7 +33,7 @@ This is a complete-source release. The installer downloads finished controller a
 - Global Abort with best-effort return through carved cells.
 - Per-worker recovery, retry, and return-to-dock controls.
 - Slot 1 reserved for fuel, with five fuel items preserved.
-- Mining storage restricted to slots 2–16, with matching items automatically stacked and compacted.
+- Mining storage is restricted to slots 2–16; compatible drops use normal native stacking without per-block compaction.
 - Five-second entity wait, exactly one attack, then stop and report.
 - One-command factory reset: `roomba reset`.
 
@@ -57,13 +59,13 @@ Delete obsolete patch files such as `patch_v012.lua`.
 Controller:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 controller
 ```
 
 Every worker:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 worker
 ```
 
 The installer preserves existing controller maps/state and worker dock state. For a clean device, run:
@@ -75,7 +77,7 @@ roomba reset
 Remote reset when the local command is unavailable:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 reset
 ```
 
 ## Physical layout
@@ -127,7 +129,7 @@ Press `W`, choose a worker number, then choose an action:
 3  Return to dock and stop
 4  Pause this worker
 5  Resume this worker
-6  Restart remaining work from dock
+6  Restart remaining work from dock / after fuel restock
 7  Clear displayed error
 8  Forget this worker record
 0  Back
@@ -167,12 +169,15 @@ It does not attack or crash. It checks once per second and continues automatical
 - Normal refuelling keeps five fuel items in slot 1.
 - At five items, the worker returns to the shared fuel chest.
 - A non-fuel item in slot 1 is moved to an empty storage slot or reported safely.
-- Consecutive identical drops stay in the same selected storage slot.
-- Matching stacks are periodically merged to prevent one-item slot fragmentation.
+- The worker keeps a normal storage slot selected and relies on CC:Tweaked’s native compatible-item stacking.
+- No full-inventory scan or stack transfer occurs after each mined block.
+- Inventory capacity is checked periodically and conservatively unloaded before it can run out of safe slots.
+- If the station cannot restore slot 1 above five items, the worker returns to dock and displays **RESTOCK FUEL STATION**.
+- After restocking, use Workers → option 6 to continue that worker's remaining layers.
 
 ## First acceptance test
 
-1. Upload all v0.2.1 files.
+1. Upload all v0.2.2 files.
 2. Reinstall one controller and one worker.
 3. Detect and calibrate a disposable small map.
 4. Start a two-layer job.
@@ -183,6 +188,8 @@ It does not attack or crash. It checks once per second and continues automatical
 9. Test Workers → Restart remaining work from dock.
 10. Test Workers → Recover and retry after a safe, deliberately created error.
 11. Watch the worker's local screen and confirm status, layer, progress, fuel, and storage update live.
-12. Mine several identical blocks and confirm they stack instead of occupying one slot each.
+12. Mine several identical blocks and confirm they stack without a pause after every block.
+13. Empty the shared fuel chest, let the worker attempt a refill, and confirm it returns to dock showing **RESTOCK FUEL STATION**.
+14. Restock the chest and use Workers → option 6 to continue the unfinished section.
 
 Minecraft and CC:Tweaked were not available in the build environment, so supervise this acceptance test before using a valuable quarry.
