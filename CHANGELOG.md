@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.3
+
+- Added controller-triggered over-the-air worker updates.
+- Updating the controller now sends update requests to known connected turtles before the controller reboots.
+- Docked workers update immediately; busy or underground workers queue the update until they safely return to their dock.
+- Added `[U] Update Hive` to the controller UI.
+- Added `roomba update` as a one-command updater.
+- Added worker update status, target version, failure reporting, rollback backups, syntax validation, and automatic reboot.
+- Controller worker details now show each turtle's reported software version.
+- v0.2.2 workers require one final manual worker installation to receive the over-the-air updater; later releases can be deployed from the controller alone.
+
 ## v0.2.2
 
 - Removed per-block inventory snapshots and stack transfers.

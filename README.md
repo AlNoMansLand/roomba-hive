@@ -1,22 +1,23 @@
-# Roomba Hive v0.2.2
+# Roomba Hive v0.2.3
 
 A coordinated CC:Tweaked excavation system for one Advanced Computer and up to four mining turtles.
 
 This is a complete-source release. The installer downloads finished controller and worker programs directly; it does not use a runtime patcher.
 
-## v0.2.2 highlights
+## v0.2.3 highlights
 
-- The **Workers** screen is now interactive: select an individual turtle to inspect and control it.
-- Recover and retry a selected worker after an error without restarting the other workers.
-- Return one selected worker to its dock and park it while the rest of the job continues.
-- Pause or resume one selected worker.
-- Re-send only that worker's unfinished section once it is docked.
-- Ping a worker, clear a stale displayed error, or forget an unused worker record.
-- ComputerCraft turtles/computers blocking a shaft now produce `blocked_waiting` instead of a hard crash. The worker checks every second and automatically continues when the obstruction is removed.
-- Turtle labels use physical controller sides: **front, right, back, left**. They no longer pretend those sides are real world compass directions.
-- Fixed worker turn tracking so a right turn updates the logical direction exactly once.
-- Removed the per-block inventory snapshot/transfer routine, restoring fast native stacking.
-- Empty fuel stations no longer trap workers: they return to dock and display **RESTOCK FUEL STATION**.
+- Updating the controller automatically updates known connected turtles.
+- Docked workers download, validate, install, and reboot without opening their terminals.
+- Busy or underground workers safely queue the update and install it after returning to their assigned dock.
+- The controller UI now includes **U — Update Hive**.
+- The shell command `roomba update` runs the same updater.
+- Worker files are fully downloaded before replacement, syntax-checked, and backed up as `.old`.
+- Failed downloads or installs leave the current worker program available and report `update_failed`.
+- Controller worker details show each turtle's reported version and any pending update.
+
+### One-time bootstrap
+
+Workers running v0.2.2 or older do not yet understand the over-the-air update request. Install v0.2.3 manually on each turtle **one final time**. After every worker is on v0.2.3 or later, future releases can be installed by updating only the controller.
 
 ## Included features
 
@@ -35,6 +36,8 @@ This is a complete-source release. The installer downloads finished controller a
 - Slot 1 reserved for fuel, with five fuel items preserved.
 - Mining storage is restricted to slots 2–16; compatible drops use normal native stacking without per-block compaction.
 - Five-second entity wait, exactly one attack, then stop and report.
+- One-command hive update: `[U] Update Hive` or `roomba update` on the controller.
+- Automatic over-the-air updates for workers running v0.2.3 or later.
 - One-command factory reset: `roomba reset`.
 
 ## Files to upload
@@ -59,13 +62,13 @@ Delete obsolete patch files such as `patch_v012.lua`.
 Controller:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=023 controller
 ```
 
 Every worker:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=023 worker
 ```
 
 The installer preserves existing controller maps/state and worker dock state. For a clean device, run:
@@ -77,8 +80,43 @@ roomba reset
 Remote reset when the local command is unavailable:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=022 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=023 reset
 ```
+
+## Automatic updates
+
+After the one-time v0.2.3 worker installation, future updates require only the controller.
+
+From the running controller UI:
+
+```text
+U
+```
+
+Confirm by typing:
+
+```text
+UPDATE
+```
+
+Or stop the controller UI and run:
+
+```text
+roomba update
+```
+
+The latest installer reads the controller's saved worker records and sends an update request over Rednet before replacing the controller files.
+
+Worker behavior:
+
+- Physically docked and idle workers update immediately.
+- Busy workers store the target version and continue their current assignment.
+- A queued update installs only after the worker is back at its assigned dock at `Y=0`.
+- Offline workers cannot receive the request and must be updated later.
+- A worker whose Lua program has fully crashed cannot receive an update until it is rebooted.
+- Each worker downloads all replacement files, validates their Lua syntax, keeps `.old` backups, reports the result, and reboots itself.
+
+The controller can reboot before the workers finish downloading; each accepted worker update is self-contained.
 
 ## Physical layout
 
@@ -116,6 +154,7 @@ R  Resume the entire job
 A  Abort the entire job
 W  Open worker management
 M  View maps
+U  Update the controller and all connected workers
 Q  Close controller UI
 ```
 
@@ -177,7 +216,7 @@ It does not attack or crash. It checks once per second and continues automatical
 
 ## First acceptance test
 
-1. Upload all v0.2.2 files.
+1. Upload all v0.2.3 files.
 2. Reinstall one controller and one worker.
 3. Detect and calibrate a disposable small map.
 4. Start a two-layer job.
@@ -191,5 +230,7 @@ It does not attack or crash. It checks once per second and continues automatical
 12. Mine several identical blocks and confirm they stack without a pause after every block.
 13. Empty the shared fuel chest, let the worker attempt a refill, and confirm it returns to dock showing **RESTOCK FUEL STATION**.
 14. Restock the chest and use Workers → option 6 to continue the unfinished section.
+15. With the worker docked, run `U` on the controller and verify the turtle displays Installing update and reboots automatically.
+16. Confirm Workers shows the updated worker version after it reconnects.
 
 Minecraft and CC:Tweaked were not available in the build environment, so supervise this acceptance test before using a valuable quarry.

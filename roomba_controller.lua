@@ -1,9 +1,10 @@
--- Roomba Hive Controller v0.2.2
+-- Roomba Hive Controller v0.2.3
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.2.2"
+local VERSION = "0.2.3"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
+local INSTALL_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua"
 local ROOT = "/roomba"
 local MAP_DIR = fs.combine(ROOT, "maps")
 local STATE_FILE = fs.combine(ROOT, "state.db")
@@ -219,7 +220,7 @@ local function render()
     print("[D] Detect  [C] Calibrate  [J] Start")
     print("[P] Pause   [R] Resume     [A] Abort")
     print("[W] Workers [M] Maps       [I] Import")
-    print("[Q] Quit UI")
+    print("[U] Update Hive             [Q] Quit UI")
 end
 
 local function detectDocks()
@@ -539,6 +540,7 @@ local function handleMessage(sender, message)
 
     elseif message.type == "hello" or message.type == "heartbeat" then
         worker.status = message.status or worker.status or "online"
+        worker.version = message.version or worker.version
         worker.layer = message.layer
         worker.fuel = message.fuel or worker.fuel
         worker.position = message.position or worker.position
@@ -618,6 +620,36 @@ local function handleMessage(sender, message)
             position = message.position,
         }
         if state.fuelLock == sender then state.fuelLock = nil end
+
+    elseif message.type == "update_accepted" then
+        worker.status = "updating"
+        worker.updateTarget = message.targetVersion
+        worker.error = nil
+
+    elseif message.type == "update_deferred" then
+        worker.status = "update_pending"
+        worker.updateTarget = message.targetVersion
+        worker.updateReason = message.reason
+
+    elseif message.type == "update_installed" then
+        worker.status = "rebooting_after_update"
+        worker.version = message.targetVersion or worker.version
+        worker.updateTarget = nil
+        worker.updateReason = nil
+        worker.error = nil
+
+    elseif message.type == "update_current" then
+        worker.version = message.targetVersion or message.version or worker.version
+        worker.updateTarget = nil
+        worker.updateReason = nil
+
+    elseif message.type == "update_failed" then
+        worker.status = "update_failed"
+        worker.updateTarget = message.targetVersion
+        worker.error = {
+            message = message.message or "Worker update failed.",
+            position = message.position,
+        }
 
     elseif message.type == "worker_error" then
         worker.status = "ERROR: " .. tostring(message.message)
@@ -714,6 +746,11 @@ local function workerDetails(worker)
     print("Physical dock: " .. titleCase(displayDock(worker.dock)))
     print("Logical dock: " .. tostring(worker.dock or "unassigned"))
     print("Status: " .. tostring(worker.status or "unknown"))
+    print("Version: " .. tostring(worker.version or "unknown"))
+    if worker.updateTarget then
+        print("Update target: " .. tostring(worker.updateTarget))
+        if worker.updateReason then print("Update wait: " .. tostring(worker.updateReason)) end
+    end
     print("Layer: " .. tostring(worker.layer or "-"))
     print("Fuel: " .. tostring(worker.fuel or "?"))
     if worker.position then print("Position: " .. textutils.serialize(worker.position)) end
@@ -885,6 +922,37 @@ local function mapsView()
     read()
 end
 
+local function updateHive()
+    if isActiveJob() then
+        print("\nFinish, park, or abort the active job before updating the hive.")
+        sleep(2)
+        return
+    end
+
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("UPDATE ROOMBA HIVE")
+    print("==================")
+    print("The latest installer will:")
+    print("- request updates on known connected workers")
+    print("- queue busy workers until safely docked")
+    print("- update this controller")
+    print("- reboot updated devices")
+    print("")
+    print("Workers need v0.2.3+ for automatic updates.")
+    write("Type UPDATE to continue: ")
+    if read() ~= "UPDATE" then return end
+
+    local separator = INSTALL_URL:find("?", 1, true) and "&" or "?"
+    local url = INSTALL_URL .. separator .. "launch=" .. tostring(os.epoch("utc"))
+    local ok = shell.run("wget", "run", url, "controller")
+    if not ok then
+        printError("The updater did not complete.")
+        print("Press Enter.")
+        read()
+    end
+end
+
 local function uiLoop()
     while running do
         render()
@@ -899,6 +967,7 @@ local function uiLoop()
         elseif character == "a" then abortJob()
         elseif character == "w" then workersView()
         elseif character == "m" then mapsView()
+        elseif character == "u" then updateHive()
         elseif character == "q" then running = false
         end
     end

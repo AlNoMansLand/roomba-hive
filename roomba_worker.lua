@@ -1,9 +1,10 @@
--- Roomba Hive Worker v0.2.2
+-- Roomba Hive Worker v0.2.3
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.2.2"
+local VERSION = "0.2.3"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
+local UPDATE_BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
 local ROOT = "/roomba"
 local STATE_FILE = fs.combine(ROOT, "worker_state.db")
 
@@ -85,6 +86,16 @@ local dock = state.dock
 local pos = state.pos or { x = 0, y = 0, z = 0, dir = NORTH }
 local movesSinceSave = 0
 
+-- A successful updater reboots after marking the device as updating. On the
+-- next boot, restore the normal docked state before reporting to the controller.
+if state.status == "updating" and dock and dockInfo[dock] then
+    local info = dockInfo[dock]
+    if pos.y == 0 and pos.x == info.x and pos.z == info.z then
+        state.status = "docked"
+        state.error = nil
+    end
+end
+
 local interior = {}
 local bounds = nil
 local carved = {}
@@ -122,6 +133,9 @@ local STATUS_LABELS = {
     error = "Stopped with an error",
     dock_conflict = "Dock assignment conflict",
     working = "Working",
+    update_pending = "Update queued",
+    updating = "Installing update",
+    update_failed = "Update failed",
 }
 
 local function trimLine(value, width)
@@ -171,6 +185,9 @@ local function renderWorkerScreen(force)
 
     local controllerText = controller and ("#" .. tostring(controller)) or "searching"
     writeLine("Controller: " .. controllerText .. " | Modem: " .. modemSide)
+    if state.pendingUpdate then
+        writeLine("Update queued: v" .. tostring(state.pendingUpdate.version), colors.cyan)
+    end
 
     local statusText = STATUS_LABELS[state.status] or tostring(state.status or "unknown")
     local statusColor = state.status == "error" and colors.red
@@ -253,6 +270,208 @@ local function send(kind, data)
     data.version = VERSION
     if data.dock == nil then data.dock = dock end
     return rednet.send(controller, data, PROTOCOL)
+end
+
+
+local function isPhysicallyDocked()
+    local info = dock and dockInfo[dock] or nil
+    return info ~= nil
+        and pos.y == 0
+        and pos.x == info.x
+        and pos.z == info.z
+end
+
+local function normalizeUpdateRequest(message)
+    if type(message) ~= "table" then return nil end
+    local targetVersion = tostring(message.version or "")
+    local cacheTag = tostring(message.cacheTag or "")
+    if targetVersion == "" or cacheTag == "" then return nil end
+    return {
+        version = targetVersion,
+        cacheTag = cacheTag,
+        requestedAt = os.epoch("utc"),
+    }
+end
+
+local function updateUrl(remote, cacheTag)
+    local separator = UPDATE_BASE_URL:find("?", 1, true) and "&" or "?"
+    return UPDATE_BASE_URL .. "/" .. remote
+        .. separator .. "v=" .. tostring(cacheTag)
+        .. "&worker=" .. tostring(os.getComputerID())
+        .. "&t=" .. tostring(os.epoch("utc"))
+end
+
+local function cleanUpdateTemps()
+    local paths = {
+        "/roomba/worker.lua.update",
+        "/startup.lua.update",
+        "/roomba.lua.update",
+    }
+    for _, path in ipairs(paths) do
+        if fs.exists(path) then fs.delete(path) end
+    end
+end
+
+local function applyPendingUpdate()
+    local request = state.pendingUpdate
+    if type(request) ~= "table" then return false end
+    if taskActive or not isPhysicallyDocked() or fuelLockHeld then return false end
+
+    if request.version == VERSION and not request.force then
+        state.pendingUpdate = nil
+        state.error = nil
+        persist(true)
+        send("update_current", { targetVersion = request.version })
+        return false
+    end
+
+    if not http then
+        state.status = "update_failed"
+        state.error = "HTTP is disabled; worker update could not download."
+        uiMessage = state.error
+        persist(true)
+        renderWorkerScreen(true)
+        send("update_failed", { targetVersion = request.version, message = state.error })
+        return false
+    end
+
+    setStatus("updating", "Downloading Roomba Hive v" .. tostring(request.version))
+    send("update_accepted", { targetVersion = request.version })
+
+    local files = {
+        { remote = "roomba_worker.lua", localPath = "/roomba/worker.lua" },
+        { remote = "startup_worker.lua", localPath = "/startup.lua" },
+        { remote = "roomba.lua", localPath = "/roomba.lua" },
+    }
+
+    cleanUpdateTemps()
+    for _, entry in ipairs(files) do
+        uiMessage = "Downloading " .. entry.remote
+        renderWorkerScreen(true)
+
+        local response, requestError = http.get(updateUrl(entry.remote, request.cacheTag))
+        if not response then
+            cleanUpdateTemps()
+            state.status = "update_failed"
+            state.error = "Download failed for " .. entry.remote .. ": " .. tostring(requestError)
+            uiMessage = state.error
+            persist(true)
+            renderWorkerScreen(true)
+            send("update_failed", { targetVersion = request.version, message = state.error })
+            return false
+        end
+
+        local body = response.readAll()
+        response.close()
+        if not body or body == "" then
+            cleanUpdateTemps()
+            state.status = "update_failed"
+            state.error = "Downloaded an empty file: " .. entry.remote
+            uiMessage = state.error
+            persist(true)
+            renderWorkerScreen(true)
+            send("update_failed", { targetVersion = request.version, message = state.error })
+            return false
+        end
+
+        local compiled, syntaxError = load(body, "@" .. entry.localPath, "t", _ENV)
+        if not compiled then
+            cleanUpdateTemps()
+            state.status = "update_failed"
+            state.error = "Syntax error in " .. entry.remote .. ": " .. tostring(syntaxError)
+            uiMessage = state.error
+            persist(true)
+            renderWorkerScreen(true)
+            send("update_failed", { targetVersion = request.version, message = state.error })
+            return false
+        end
+
+        local handle, openError = fs.open(entry.localPath .. ".update", "w")
+        if not handle then
+            cleanUpdateTemps()
+            state.status = "update_failed"
+            state.error = "Cannot write update file: " .. tostring(openError)
+            uiMessage = state.error
+            persist(true)
+            renderWorkerScreen(true)
+            send("update_failed", { targetVersion = request.version, message = state.error })
+            return false
+        end
+        handle.write(body)
+        handle.close()
+    end
+
+    local committed = {}
+    local ok, commitError = pcall(function()
+        for _, entry in ipairs(files) do
+            local backup = entry.localPath .. ".old"
+            if fs.exists(backup) then fs.delete(backup) end
+            if fs.exists(entry.localPath) then fs.move(entry.localPath, backup) end
+            fs.move(entry.localPath .. ".update", entry.localPath)
+            committed[#committed + 1] = entry
+        end
+    end)
+
+    if not ok then
+        for _, entry in ipairs(files) do
+            local backup = entry.localPath .. ".old"
+            if fs.exists(backup) then
+                if fs.exists(entry.localPath) then fs.delete(entry.localPath) end
+                fs.move(backup, entry.localPath)
+            end
+        end
+        cleanUpdateTemps()
+        state.status = "update_failed"
+        state.error = "Could not install update: " .. tostring(commitError)
+        uiMessage = state.error
+        persist(true)
+        renderWorkerScreen(true)
+        send("update_failed", { targetVersion = request.version, message = state.error })
+        return false
+    end
+
+    state.pendingUpdate = nil
+    state.error = nil
+    state.status = "updating"
+    state.installedVersion = request.version
+    uiMessage = "Update installed; rebooting"
+    persist(true)
+    renderWorkerScreen(true)
+    send("update_installed", { targetVersion = request.version })
+    sleep(1)
+    os.reboot()
+    return true
+end
+
+local function queueUpdateRequest(message)
+    local request = normalizeUpdateRequest(message)
+    if not request then
+        send("update_failed", { message = "Controller sent an invalid update request." })
+        return
+    end
+
+    if request.version == VERSION and not message.force then
+        state.pendingUpdate = nil
+        persist(true)
+        send("update_current", { targetVersion = request.version })
+        return
+    end
+
+    request.force = message.force == true
+    state.pendingUpdate = request
+    persist(true)
+
+    if taskActive or not isPhysicallyDocked() or fuelLockHeld then
+        send("update_deferred", {
+            targetVersion = request.version,
+            reason = taskActive and "worker busy"
+                or (not isPhysicallyDocked() and "worker not docked")
+                or "fuel station in use",
+        })
+        return
+    end
+
+    applyPendingUpdate()
 end
 
 local function releaseFuelLock()
@@ -791,6 +1010,8 @@ local function applyTaskMessage(message)
         fuelLockGranted = true
     elseif message.type == "fuel_lock_wait" then
         fuelLockGranted = false
+    elseif message.type == "update_request" then
+        queueUpdateRequest(message)
     end
 end
 
@@ -1269,6 +1490,7 @@ local function runManagedTask(taskFunction)
 
     taskActive = false
     persist(true)
+    applyPendingUpdate()
     return taskOk, taskError
 end
 
@@ -1322,6 +1544,7 @@ local function commandLoop()
     while true do
         local sender, message, protocol = rednet.receive(PROTOCOL, 5)
         if not sender then
+            applyPendingUpdate()
             renderWorkerScreen(false)
             local found = rednet.lookup(PROTOCOL, HOSTNAME)
             if found then controller = found end
@@ -1348,6 +1571,7 @@ local function commandLoop()
                 setStatus("docked", "Docked, unloaded, and ready")
                 restoreComputerLabel()
                 send("hello", { status = "docked", fuel = fuelLevel(), position = pos })
+                applyPendingUpdate()
 
             elseif message.type == "dock_conflict" then
                 state.error = "Dock conflict at " .. tostring(message.dock)
@@ -1429,6 +1653,9 @@ local function commandLoop()
                         end
                     end
                 end
+
+            elseif message.type == "update_request" then
+                queueUpdateRequest(message)
 
             elseif message.type == "status_request" then
                 send("heartbeat", {

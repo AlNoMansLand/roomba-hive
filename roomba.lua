@@ -1,6 +1,7 @@
--- Roomba Hive command utility v0.2.2
+-- Roomba Hive command utility v0.2.3
 
-local VERSION = "0.2.2"
+local VERSION = "0.2.3"
+local INSTALL_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua"
 local args = { ... }
 local command = args[1] and args[1]:lower() or "help"
 
@@ -27,12 +28,36 @@ local function factoryReset()
     os.reboot()
 end
 
+local function detectRole()
+    if fs.exists("/roomba/controller.lua") then return "controller" end
+    if fs.exists("/roomba/worker.lua") then return "worker" end
+    return nil
+end
+
+local function update()
+    local role = detectRole()
+    if not role then
+        printError("No Roomba controller or worker installation was found.")
+        return
+    end
+
+    local separator = INSTALL_URL:find("?", 1, true) and "&" or "?"
+    local url = INSTALL_URL .. separator .. "launch=" .. tostring(os.epoch("utc"))
+    print("Updating Roomba Hive " .. role .. "...")
+    local ok = shell.run("wget", "run", url, role)
+    if not ok then printError("Update did not complete.") end
+end
+
 if command == "reset" then
     factoryReset()
+elseif command == "update" then
+    update()
 elseif command == "version" then
     print("Roomba Hive v" .. VERSION)
 elseif command == "help" then
     print("Roomba Hive commands:")
+    print("  roomba update   Update this device")
+    print("                  Controller updates also update connected workers")
     print("  roomba reset    Factory-reset this device")
     print("  roomba version  Show the installed release")
     print("  roomba help     Show this help")
