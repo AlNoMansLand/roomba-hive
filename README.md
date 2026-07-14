@@ -1,33 +1,43 @@
-# Roomba Hive v0.2.0
+# Roomba Hive v0.2.1
 
 A coordinated CC:Tweaked excavation system for one Advanced Computer and up to four mining turtles.
 
-This release is a **complete replacement build**. It does not use `patch_v012.lua` or modify old source code at runtime.
+This is a complete-source release. The installer downloads finished controller and worker programs directly; it does not use a runtime patcher.
+
+## v0.2.1 highlights
+
+- The **Workers** screen is now interactive: select an individual turtle to inspect and control it.
+- Recover and retry a selected worker after an error without restarting the other workers.
+- Return one selected worker to its dock and park it while the rest of the job continues.
+- Pause or resume one selected worker.
+- Re-send only that worker's unfinished section once it is docked.
+- Ping a worker, clear a stale displayed error, or forget an unused worker record.
+- ComputerCraft turtles/computers blocking a shaft now produce `blocked_waiting` instead of a hard crash. The worker checks every second and automatically continues when the obstruction is removed.
+- Turtle labels use physical controller sides: **front, right, back, left**. They no longer pretend those sides are real world compass directions.
+- Fixed worker turn tracking so a right turn updates the logical direction exactly once.
 
 ## Included features
 
+- Live turtle status panel showing controller, dock, task, layer, progress, fuel, storage, position, and errors.
 - One controller at the quarry origin.
-- Up to four workers assigned to north, east, south, and west shafts.
+- Up to four workers on the controller's front, right, back, and left sides.
 - Closed-outline calibration and reusable map files.
-- Legacy `roomba_map.db` importing from the controller menu.
+- Legacy `roomba_map.db` import.
 - Contiguous vertical layer assignments.
-- Persistent dock identity and turtle labels after reboot.
-- Separate logical dock assignments and physical dock occupancy.
+- Persistent dock identity and labels after reboot.
 - Safe dock detection that cannot erase an active job.
-- Shared fuel-station lock at logical coordinate `0,3,0`.
-- Working Pause and Resume while turtles are actively mining.
-- Abort with best-effort return through already carved cells.
-- Force-close option when a crashed worker cannot acknowledge Abort.
-- Slot 1 reserved for fuel; mining uses only slots 2-16.
-- Five fuel items are preserved in slot 1.
-- Automatic refuel trip when slot 1 reaches five items.
-- Five-second entity wait, one attack, one final movement attempt, then stop.
+- Shared fuel-station locking at logical coordinate `0,3,0`.
+- Global and per-worker Pause/Resume.
+- Global Abort with best-effort return through carved cells.
+- Per-worker recovery, retry, and return-to-dock controls.
+- Slot 1 reserved for fuel, with five fuel items preserved.
+- Mining storage restricted to slots 2–16, with matching items automatically stacked and compacted.
+- Five-second entity wait, exactly one attack, then stop and report.
 - One-command factory reset: `roomba reset`.
-- Periodic position checkpointing instead of saving after every movement.
 
 ## Files to upload
 
-Replace or upload these files directly at the root of the GitHub repository:
+Upload or replace these files at the root of the GitHub repository:
 
 ```text
 install.lua
@@ -37,41 +47,51 @@ roomba.lua
 startup_controller.lua
 startup_worker.lua
 README.md
+CHANGELOG.md
 ```
 
-The old `patch_v012.lua` and `roomba_reset.lua` are no longer required. They may be deleted from GitHub after the new files are uploaded.
+Delete obsolete patch files such as `patch_v012.lua`.
 
 ## Installation
 
 Controller:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=020 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 controller
 ```
 
 Every worker:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=020 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 worker
 ```
 
-The installer preserves existing controller maps/state and worker dock state. It backs up the previous program as `.old` before replacing it.
-
-For a completely fresh installation, run this first:
+The installer preserves existing controller maps/state and worker dock state. For a clean device, run:
 
 ```text
 roomba reset
 ```
 
-Or remotely factory-reset without a working local installation:
+Remote reset when the local command is unavailable:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=020 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=021 reset
 ```
 
-## Base layout
+## Physical layout
 
-The Advanced Computer is logical coordinate `0,0,0`.
+The software internally calls the controller's front direction logical north. That is only a map coordinate system, not Minecraft's real compass direction.
+
+Physical workers:
+
+```text
+Front worker: directly against controller front, facing outward
+Right worker: directly against controller right, facing outward
+Back worker:  directly against controller back, facing outward
+Left worker:  directly against controller left, facing outward
+```
+
+The Advanced Computer remains logical coordinate `0,0,0`:
 
 ```text
 0,3,0  shared fuel chest
@@ -80,99 +100,89 @@ The Advanced Computer is logical coordinate `0,0,0`.
 0,0,0  Advanced Computer
 ```
 
-Workers at Y=0:
-
-```text
-North:  0,0,-1 facing north
-East:   1,0,0  facing east
-South:  0,0,1  facing south
-West:  -1,0,0  facing west
-```
-
-Each worker needs:
-
-- Mining tool upgrade.
-- Wireless or Ender Modem upgrade.
-- Output chest directly above it at Y=1.
-- Optional extraction pipe above the output chest at Y=2.
-- Clear vertical shaft directly below.
-- Clear block one step outward.
-- Clear outward ascent column from Y=0 to Y=3.
-- Clear approach block beside the central fuel chest.
-- Valid stackable fuel in slot 1 for initial setup.
-
-The shared fuel chest must contain valid turtle fuel only.
+Each worker needs a mining tool, wireless/ender modem, output chest directly above, a clear shaft below, and the clear outward route to the fuel chest.
 
 ## Controller controls
 
 ```text
 D  Detect physically docked workers
-C  Calibrate and save a new map
-I  Import a legacy map database
-J  Start an excavation job
-P  Pause active workers at their next safe movement boundary
-R  Resume a paused job
-A  Abort the job or force-close an unresponsive abort
-W  View worker status and errors
-M  View saved maps
-Q  Close the controller UI
+C  Calibrate a map
+I  Import a legacy map
+J  Start a job
+P  Pause the entire job
+R  Resume the entire job
+A  Abort the entire job
+W  Open worker management
+M  View maps
+Q  Close controller UI
 ```
 
-### Pause
+## Worker management
 
-Pause is processed concurrently while workers mine. A worker finishes its current atomic turtle action, then waits without advancing the route. Resume continues from the same route position.
+Press `W`, choose a worker number, then choose an action:
 
-### Abort
+```text
+1  Refresh / ping
+2  Recover and retry remaining work
+3  Return to dock and stop
+4  Pause this worker
+5  Resume this worker
+6  Restart remaining work from dock
+7  Clear displayed error
+8  Forget this worker record
+0  Back
+```
 
-A live worker attempts to:
+### Recover and retry
 
-1. Stop at the next safe movement boundary.
-2. Travel through already carved cells to the map center.
-3. Return to its assigned shaft.
-4. Ascend to the dock.
-5. Unload slots 2-16.
-6. Release the fuel-station lock.
-7. Clear its job state and report that it is docked.
+This is intended for errors such as an obstruction, protected block, or failed movement while the worker program is still running.
 
-If a worker's Lua program has already crashed, Abort is still useful because this release leaves the command listener running after most task errors. Pressing Abort can recover from many error states without rebooting.
+The worker:
 
-A worker that rebooted underground cannot reliably reconstruct its carved route. Such a worker still requires manual recovery. If the controller waits forever for it, press Abort again and type `FORCE` to close the controller job state.
+1. Uses its in-memory carved route to return to the center or shaft.
+2. Ascends to the dock.
+3. Unloads slots 2–16.
+4. Restarts at the first incomplete layer in its assigned section.
 
-## Fuel and inventory behavior
+A partially mined layer is traversed again from the beginning, but air blocks are not re-mined. A turtle that rebooted underground cannot reconstruct its in-memory carved route and may still need manual recovery.
+
+### Return to dock and stop
+
+This parks only the selected worker. Other workers continue. The parked worker's unfinished layers remain incomplete and can later be restarted from the worker menu.
+
+### Blocked waiting
+
+When a ComputerCraft turtle or computer occupies the worker's next shaft block, the worker reports:
+
+```text
+blocked_waiting
+```
+
+It does not attack or crash. It checks once per second and continues automatically after the obstruction is removed. Pause, Return, and Abort remain available while it waits.
+
+## Fuel and inventory
 
 - Slot 1 is fuel-only.
-- Slots 2-16 are mining storage.
-- The worker selects an empty storage slot before every dig.
-- When slots 2-16 have no empty slot, it unloads before digging again.
-- Normal refuelling never consumes the final five fuel items in slot 1.
-- Reaching five items triggers a refuel trip.
-- Emergency fuel handling may consume below five only if required to escape the fuel station, but it keeps at least one item where possible.
-- A non-fuel item found in slot 1 is moved into an empty storage slot; the worker stops if it cannot move it safely.
+- Slots 2–16 are mining storage.
+- Normal refuelling keeps five fuel items in slot 1.
+- At five items, the worker returns to the shared fuel chest.
+- A non-fuel item in slot 1 is moved to an empty storage slot or reported safely.
+- Consecutive identical drops stay in the same selected storage slot.
+- Matching stacks are periodically merged to prevent one-item slot fragmentation.
 
-## Hazard behavior
+## First acceptance test
 
-- **Entities:** wait five seconds, attack exactly once, attempt movement once, then stop and report.
-- **Computers/turtles/inventories:** protected and not deliberately mined.
-- **Sand/gravel:** repeatedly dug up to a safety limit.
-- **Undiggable blocks:** stop and report coordinates.
-- **Water:** workers continue; the excavation may flood.
-- **Lava:** standard turtle inspection cannot reliably detect every fluid source before entering it. Supervise lava-prone jobs.
+1. Upload all v0.2.1 files.
+2. Reinstall one controller and one worker.
+3. Detect and calibrate a disposable small map.
+4. Start a two-layer job.
+5. Place another turtle temporarily above the active worker's shaft.
+6. Confirm the worker reports `blocked_waiting` rather than crashing.
+7. Remove the obstruction and confirm it continues automatically.
+8. Test Workers → Return to dock and stop.
+9. Test Workers → Restart remaining work from dock.
+10. Test Workers → Recover and retry after a safe, deliberately created error.
+11. Watch the worker's local screen and confirm status, layer, progress, fuel, and storage update live.
+12. Mine several identical blocks and confirm they stack instead of occupying one slot each.
 
-## Testing order
-
-Use a disposable quarry for the first test:
-
-1. Upload all replacement files.
-2. Factory-reset one controller and one turtle.
-3. Install both with the v0.2.0 commands.
-4. Detect the single dock.
-5. Calibrate a small 5x5 or 7x7 interior.
-6. Start a one-layer job.
-7. Test Pause and Resume.
-8. Start another small job and test Abort.
-9. Confirm slot 1 never receives mined blocks and refuelling begins at five fuel items.
-10. Add the other workers only after the single-worker test succeeds.
-
-## Validation performed outside Minecraft
-
-All included Lua files were parsed successfully with a Lua parser. The project cannot be fully executed against CC:Tweaked's turtle, modem, rednet, filesystem, and peripheral APIs in this environment, so the first in-game run should still be supervised.
+Minecraft and CC:Tweaked were not available in the build environment, so supervise this acceptance test before using a valuable quarry.

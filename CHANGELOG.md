@@ -1,15 +1,22 @@
 # Changelog
 
+## v0.2.1
+
+- Replaced the static worker startup text with a live task, progress, fuel, storage, position, and error panel.
+
+- Fixed one-item inventory fragmentation by following the slot that receives each mined drop.
+
+- Added periodic merging of matching stacks in storage slots 2–16.
+
+- Added interactive per-worker management menu.
+- Added targeted status refresh, pause, resume, return-to-dock, retry, remaining-section restart, error clearing, and record removal.
+- Added safe recover-and-retry flow that returns, unloads, and restarts from the selected worker's first incomplete layer.
+- Added per-worker parking without aborting the whole job.
+- Made ComputerCraft turtle/computer shaft obstructions recoverable and automatically resumable.
+- Changed labels from assumed compass directions to physical controller side names.
+- Fixed right-turn direction tracking being incremented twice.
+
 ## v0.2.0
 
-- Replaced all runtime patching with complete controller and worker files.
-- Added working concurrent Pause and Resume.
-- Added Abort recovery and controller force-close.
-- Added `roomba reset` factory-reset command.
-- Added five-item fuel reserve and automatic refuel trigger.
-- Reserved slot 1 for fuel and selected slots 2-16 before digging.
-- Preserved dock identity and labels after reboot.
-- Kept logical assignments separate from physical dock occupancy.
-- Added legacy map import.
-- Reduced filesystem writes by checkpointing position periodically.
-- Added installer syntax validation and atomic file replacement.
+- Complete replacement release without runtime patching.
+- Added working pause, resume, abort, factory reset, fuel reserve, inventory protection, legacy import, safe dock state, and periodic checkpoints.

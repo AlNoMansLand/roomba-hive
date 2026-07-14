@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.2.0
+-- Roomba Hive Worker v0.2.1
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.2.0"
+local VERSION = "0.2.1"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -34,6 +34,7 @@ local dockInfo = {
     south = { x = 0, z = 1, out = SOUTH, inward = NORTH },
     west = { x = -1, z = 0, out = WEST, inward = EAST },
 }
+local dockDisplay = { north = "front", east = "right", south = "back", west = "left" }
 local neighbors = {
     { dx = 0, dz = -1, dir = NORTH },
     { dx = 1, dz = 0, dir = EAST },
@@ -90,9 +91,130 @@ local wall = {}
 
 local paused = false
 local abortRequested = false
+local parkRequested = false
 local taskActive = false
 local fuelLockGranted = false
 local fuelLockHeld = false
+
+local uiMessage = "Starting worker"
+local lastUiRender = 0
+
+local STATUS_LABELS = {
+    unassigned = "Waiting for dock assignment",
+    docked = "Docked and ready",
+    starting = "Preparing assigned section",
+    descending = "Descending to mining layer",
+    mining = "Mining",
+    returning = "Returning to dock",
+    returning_by_command = "Returning by command",
+    refueling = "Refueling",
+    waiting_for_fuel = "Waiting for fuel in chest",
+    waiting_fuel_lock = "Waiting for shared fuel station",
+    paused = "Paused safely",
+    blocked_waiting = "Blocked - waiting for clearance",
+    output_full = "Output chest is full",
+    recovering = "Recovering worker position",
+    calibrating = "Calibrating map boundary",
+    parked = "Parked at dock",
+    aborted = "Job aborted",
+    error = "Stopped with an error",
+    dock_conflict = "Dock assignment conflict",
+    working = "Working",
+}
+
+local function trimLine(value, width)
+    value = tostring(value or "")
+    if #value <= width then return value end
+    if width <= 3 then return value:sub(1, width) end
+    return value:sub(1, width - 3) .. "..."
+end
+
+local function storageSummary()
+    local usedSlots = 0
+    local itemCount = 0
+    for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
+        local count = turtle.getItemCount(slot)
+        if count > 0 then usedSlots = usedSlots + 1 end
+        itemCount = itemCount + count
+    end
+    return usedSlots, itemCount
+end
+
+local function renderWorkerScreen(force)
+    local now = os.epoch("utc")
+    if not force and now - lastUiRender < 500 then return end
+    lastUiRender = now
+
+    local width, height = term.getSize()
+    local line = 1
+
+    local function writeLine(value, color)
+        if line > height then return end
+        term.setCursorPos(1, line)
+        term.clearLine()
+        if term.isColor and term.isColor() and color then term.setTextColor(color) end
+        write(trimLine(value, width))
+        if term.isColor and term.isColor() then term.setTextColor(colors.white) end
+        line = line + 1
+    end
+
+    term.setCursorBlink(false)
+    term.setBackgroundColor(colors.black)
+    term.clear()
+
+    writeLine("Roomba Hive Worker v" .. VERSION, colors.yellow)
+
+    local dockName = dock and (dockDisplay[dock] or dock) or "unassigned"
+    writeLine("ID " .. os.getComputerID() .. " | Dock: " .. dockName)
+
+    local controllerText = controller and ("#" .. tostring(controller)) or "searching"
+    writeLine("Controller: " .. controllerText .. " | Modem: " .. modemSide)
+
+    local statusText = STATUS_LABELS[state.status] or tostring(state.status or "unknown")
+    local statusColor = state.status == "error" and colors.red
+        or state.status == "blocked_waiting" and colors.orange
+        or state.status == "paused" and colors.yellow
+        or colors.lime
+    writeLine("Status: " .. statusText, statusColor)
+    writeLine("Action: " .. tostring(uiMessage or statusText))
+
+    if state.jobId or state.firstLayer or state.layer then
+        local range = "-"
+        if state.firstLayer and state.lastLayer then
+            range = tostring(state.firstLayer) .. "-" .. tostring(state.lastLayer)
+        end
+        writeLine("Job: " .. tostring(state.jobId or "-") .. " | Range: " .. range)
+        writeLine("Layer: " .. tostring(state.layer or "-"))
+    else
+        writeLine("Job: none")
+    end
+
+    if state.progress and state.total and state.total > 0 then
+        local percent = math.floor((state.progress / state.total) * 100)
+        writeLine("Progress: " .. state.progress .. "/" .. state.total .. " (" .. percent .. "%)")
+    else
+        writeLine("Progress: -")
+    end
+
+    local fuel = turtle.getFuelLevel()
+    writeLine("Fuel: " .. tostring(fuel) .. " | Slot 1: " .. turtle.getItemCount(FUEL_SLOT))
+
+    local usedSlots, storedItems = storageSummary()
+    writeLine("Storage: " .. usedSlots .. "/15 slots | " .. storedItems .. " items")
+
+    writeLine("Pos: " .. pos.x .. "," .. pos.y .. "," .. pos.z .. " " .. (dirNames[pos.dir] or "?"))
+
+    if state.error then
+        writeLine("Problem: " .. tostring(state.error), colors.red)
+    elseif line <= height then
+        writeLine("Ready for controller commands.")
+    end
+end
+
+local function setActivity(message)
+    uiMessage = tostring(message or "")
+    renderWorkerScreen(true)
+end
 
 local function persist(force)
     state.version = VERSION
@@ -105,14 +227,16 @@ local function persist(force)
     end
 end
 
-local function setStatus(status)
+local function setStatus(status, activity)
     state.status = status
+    uiMessage = activity or STATUS_LABELS[status] or tostring(status)
     persist(true)
+    renderWorkerScreen(true)
 end
 
 local function restoreComputerLabel()
     if dock and dockInfo[dock] then
-        os.setComputerLabel("Roomba " .. dock .. " #" .. tostring(os.getComputerID()))
+        os.setComputerLabel("Roomba " .. (dockDisplay[dock] or dock) .. " #" .. tostring(os.getComputerID()))
     elseif not os.getComputerLabel() then
         os.setComputerLabel("Roomba Worker (unassigned)")
     end
@@ -143,7 +267,9 @@ local function reportError(message, extra)
     local payload = extra or {}
     payload.message = message
     payload.position = { x = pos.x, y = pos.y, z = pos.z, dir = dirNames[pos.dir] }
+    uiMessage = message
     persist(true)
+    renderWorkerScreen(true)
     send("worker_error", payload)
     error(message, 0)
 end
@@ -163,11 +289,80 @@ local function findEmptyStorageSlot()
     return nil
 end
 
-local function selectEmptyStorageSlot()
+local function sameStack(left, right)
+    if not left or not right then return false end
+    return left.name == right.name
+        and left.damage == right.damage
+        and left.nbt == right.nbt
+end
+
+local function compactStorage()
+    local previouslySelected = turtle.getSelectedSlot()
+
+    for source = LAST_STORAGE_SLOT, FIRST_STORAGE_SLOT, -1 do
+        local sourceDetail = turtle.getItemDetail(source)
+        if sourceDetail then
+            for target = FIRST_STORAGE_SLOT, source - 1 do
+                local targetDetail = turtle.getItemDetail(target)
+                if sameStack(sourceDetail, targetDetail) and turtle.getItemSpace(target) > 0 then
+                    turtle.select(source)
+                    turtle.transferTo(target)
+                    if turtle.getItemCount(source) == 0 then break end
+                    sourceDetail = turtle.getItemDetail(source)
+                end
+            end
+        end
+    end
+
+    if previouslySelected >= FUEL_SLOT and previouslySelected <= LAST_STORAGE_SLOT then
+        turtle.select(previouslySelected)
+    else
+        turtle.select(FUEL_SLOT)
+    end
+end
+
+local function storageSnapshot()
+    local snapshot = {}
+    for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
+        snapshot[slot] = turtle.getItemCount(slot)
+    end
+    return snapshot
+end
+
+local function selectCollectionSlot()
+    local selected = turtle.getSelectedSlot()
+    if selected >= FIRST_STORAGE_SLOT
+        and selected <= LAST_STORAGE_SLOT
+        and turtle.getItemSpace(selected) > 0 then
+        return selected
+    end
+
+    compactStorage()
     local slot = findEmptyStorageSlot()
     if not slot then return nil end
     turtle.select(slot)
     return slot
+end
+
+local function followCollectedItem(before)
+    local bestSlot = nil
+    local bestIncrease = 0
+
+    for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
+        local increase = turtle.getItemCount(slot) - (before[slot] or 0)
+        if increase > bestIncrease and turtle.getItemSpace(slot) > 0 then
+            bestIncrease = increase
+            bestSlot = slot
+        end
+    end
+
+    if bestSlot then turtle.select(bestSlot) end
+end
+
+local function hasEmptyStorageSlot()
+    if findEmptyStorageSlot() then return true end
+    compactStorage()
+    return findEmptyStorageSlot() ~= nil
 end
 
 local function validateFuelSlot()
@@ -177,6 +372,10 @@ local function validateFuelSlot()
     if turtle.refuel(0) then return true end
 
     local destination = findEmptyStorageSlot()
+    if not destination then
+        compactStorage()
+        destination = findEmptyStorageSlot()
+    end
     if not destination then
         reportError("Slot 1 contains a non-fuel item and storage slots 2-16 are occupied.")
     end
@@ -260,12 +459,48 @@ local function advancePosition()
     markMoved()
 end
 
+local function isComputerCraftBlock(data)
+    local name = data and data.name or ""
+    return name:find("computercraft") ~= nil
+end
+
 local function protectedBlock(data)
     local name = data and data.name or ""
     return name:find("computercraft")
         or name:find("chest")
         or name:find("barrel")
         or name:find("shulker")
+end
+
+local function waitForComputerCraftObstruction(inspectFunction, description, resumeStatus)
+    local previousStatus = resumeStatus or state.status or "working"
+    local occupied, data = inspectFunction()
+    if not occupied or not isComputerCraftBlock(data) then return false end
+
+    state.status = "blocked_waiting"
+    state.error = "Blocked " .. description .. " by " .. tostring(data and data.name)
+    uiMessage = "Remove the ComputerCraft block to continue automatically"
+    persist(true)
+    renderWorkerScreen(true)
+    send("worker_blocked", {
+        message = state.error,
+        position = { x = pos.x, y = pos.y, z = pos.z, dir = dirNames[pos.dir] },
+    })
+
+    while true do
+        if abortRequested then error(ABORT_SIGNAL, 0) end
+        occupied, data = inspectFunction()
+        if not occupied then break end
+        if not isComputerCraftBlock(data) then
+            reportError("Recoverable obstruction was replaced by " .. tostring(data and data.name))
+        end
+        renderWorkerScreen(false)
+        sleep(1)
+    end
+
+    state.error = nil
+    setStatus(previousStatus)
+    return true
 end
 
 local function entityBlockedForward()
@@ -283,6 +518,10 @@ local function forwardOpen()
     ensureFuel(1)
     if turtle.forward() then advancePosition(); return true end
     local occupied, data = turtle.inspect()
+    if occupied and isComputerCraftBlock(data) then
+        waitForComputerCraftObstruction(turtle.inspect, "in front", state.status)
+        return forwardOpen()
+    end
     if occupied then return false, "blocked by " .. tostring(data and data.name) end
     return entityBlockedForward()
 end
@@ -305,9 +544,11 @@ local function forwardMine()
             if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("front", "inventory")) then
                 reportError("Protected block or inventory in mining route: " .. tostring(data and data.name))
             end
-            if not selectEmptyStorageSlot() then return false, "storage full", false end
+            if not selectCollectionSlot() then return false, "storage full", false end
+            local before = storageSnapshot()
             local dug, reason = turtle.dig()
             if not dug then reportError("Unable to dig block: " .. tostring(reason), { block = data and data.name }) end
+            followCollectedItem(before)
             if turtle.forward() then
                 advancePosition()
                 carved[key(pos.x, pos.z)] = true
@@ -326,6 +567,10 @@ local function upOpen()
     ensureFuel(1)
     if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
     local occupied, data = turtle.inspectUp()
+    if occupied and isComputerCraftBlock(data) then
+        waitForComputerCraftObstruction(turtle.inspectUp, "above", state.status)
+        return upOpen()
+    end
     if occupied then reportError("Vertical shaft blocked above by " .. tostring(data and data.name)) end
     sleep(5)
     if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
@@ -339,6 +584,10 @@ local function downOpen()
     ensureFuel(1)
     if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     local occupied, data = turtle.inspectDown()
+    if occupied and isComputerCraftBlock(data) then
+        waitForComputerCraftObstruction(turtle.inspectDown, "below", state.status)
+        return downOpen()
+    end
     if occupied then reportError("Expected-open route blocked below by " .. tostring(data and data.name)) end
     sleep(5)
     if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
@@ -353,12 +602,18 @@ local function downDig()
     if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     local occupied, data = turtle.inspectDown()
     if occupied then
+        if isComputerCraftBlock(data) then
+            waitForComputerCraftObstruction(turtle.inspectDown, "below the shaft", state.status)
+            return downDig()
+        end
         if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("bottom", "inventory")) then
             reportError("Protected block below the shaft.")
         end
-        if not selectEmptyStorageSlot() then reportError("Storage slots 2-16 are occupied before shaft digging.") end
+        if not selectCollectionSlot() then reportError("Storage slots 2-16 are occupied before shaft digging.") end
+        local before = storageSnapshot()
         local dug, reason = turtle.digDown()
         if not dug then reportError("Cannot dig shaft downward: " .. tostring(reason)) end
+        followCollectedItem(before)
         if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     else
         sleep(5)
@@ -545,7 +800,8 @@ local function goCenterForLayer(layer)
     turnTo(NORTH)
 end
 
-local function dumpUp()
+local function dumpUp(allowIncomplete)
+    compactStorage()
     local allUnloaded = true
     for slot = FIRST_STORAGE_SLOT, LAST_STORAGE_SLOT do
         while turtle.getItemCount(slot) > 0 do
@@ -556,7 +812,7 @@ local function dumpUp()
                 allUnloaded = false
                 state.status = "output_full"
                 persist(true)
-                if abortRequested then
+                if abortRequested or allowIncomplete then
                     turtle.select(FUEL_SLOT)
                     return false
                 end
@@ -577,6 +833,11 @@ local function applyTaskMessage(message)
     elseif message.type == "resume" then
         paused = false
     elseif message.type == "abort" then
+        parkRequested = false
+        abortRequested = true
+        paused = false
+    elseif message.type == "return_to_dock" then
+        parkRequested = true
         abortRequested = true
         paused = false
     elseif message.type == "fuel_lock_granted" then
@@ -587,6 +848,7 @@ local function applyTaskMessage(message)
 end
 
 local function taskHeartbeat()
+    renderWorkerScreen(false)
     send("heartbeat", {
         status = state.status,
         layer = state.layer,
@@ -613,7 +875,7 @@ end
 
 local function requestFuelLock()
     fuelLockGranted = false
-    setStatus("waiting_fuel_lock")
+    setStatus("waiting_fuel_lock", "Waiting for another turtle to leave the fuel station")
     local lastRequest = 0
     while not fuelLockGranted do
         if abortRequested then return false end
@@ -640,7 +902,7 @@ local function refuelAtStation(required)
     -- emergency reserve only when necessary to reach the station, while keeping
     -- at least one item in slot 1 so mined blocks still cannot occupy it.
     ensureEmergencyFuel(5)
-    setStatus("refueling")
+    setStatus("refueling", "Taking fuel from the shared fuel chest")
     turnTo(info.out)
     local moved, reason = forwardOpen()
     if not moved then releaseFuelLock(); reportError("Fuel route outward blocked: " .. tostring(reason)) end
@@ -656,11 +918,11 @@ local function refuelAtStation(required)
         if abortRequested then break end
         if turtle.getItemCount(FUEL_SLOT) <= FUEL_ITEM_RESERVE then
             if not turtle.suck(64) then
-                setStatus("waiting_for_fuel")
+                setStatus("waiting_for_fuel", "Fuel chest is empty; add coal or charcoal")
                 sleep(1)
             else
                 validateFuelSlot()
-                setStatus("refueling")
+                setStatus("refueling", "Taking fuel from the shared fuel chest")
             end
         elseif fuelLevel() < target then
             if not turtle.refuel(1) then
@@ -680,7 +942,7 @@ local function refuelAtStation(required)
     if not moved then releaseFuelLock(); reportError("Cannot return to dock from fuel route: " .. tostring(reason)) end
     turnTo(info.out)
     releaseFuelLock()
-    setStatus("docked")
+    setStatus("docked", "Docked, unloaded, and ready")
     return not abortRequested
 end
 
@@ -785,7 +1047,7 @@ local function excavateLayer(layer, route, totalMoves)
     state.layer = layer
     state.progress = 0
     state.total = totalMoves
-    setStatus("mining")
+    setStatus("mining", "Mining layer " .. tostring(layer))
     send("layer_started", { layer = layer })
     carved = { [key(0, 0)] = true }
 
@@ -796,7 +1058,7 @@ local function excavateLayer(layer, route, totalMoves)
         for _ = 1, run.count do
             safePoint("mining")
 
-            if not findEmptyStorageSlot() then
+            if not hasEmptyStorageSlot() then
                 local checkpointX, checkpointZ = pos.x, pos.z
                 unloadAndReturnToCheckpoint(layer, checkpointX, checkpointZ)
                 turnTo(run.direction)
@@ -814,8 +1076,13 @@ local function excavateLayer(layer, route, totalMoves)
             movesDone = movesDone + 1
             inventoryChecks = inventoryChecks + 1
             state.progress = movesDone
+            if movesDone % 8 == 0 then
+                uiMessage = "Mining layer " .. tostring(layer) .. " - " .. tostring(movesDone) .. "/" .. tostring(totalMoves)
+                renderWorkerScreen(false)
+            end
 
             if dug or inventoryChecks >= INVENTORY_CHECK_INTERVAL then
+                if inventoryChecks >= INVENTORY_CHECK_INTERVAL then compactStorage() end
                 inventoryChecks = 0
                 local reserve = reserveForDock(layer)
                 if not isUnlimitedFuel() and (fuelLevel() < reserve or fuelItemsLow()) then
@@ -839,7 +1106,7 @@ local function excavateLayer(layer, route, totalMoves)
     state.layer = nil
     state.progress = nil
     state.total = nil
-    setStatus("docked")
+    setStatus("docked", "Docked, unloaded, and ready")
 end
 
 local function recoverFromFuelRoute()
@@ -874,11 +1141,9 @@ local function clearJobState()
     state.error = nil
 end
 
-local function performAbort(note)
-    paused = false
-    setStatus("aborting")
-
+local function recoverToDockAndUnload()
     local info = dockInfo[dock]
+    if not info then reportError("Worker has no valid dock assignment for recovery.") end
     local outwardVector = vec[info.out]
     local outwardX = info.x + outwardVector.x
     local outwardZ = info.z + outwardVector.z
@@ -893,23 +1158,32 @@ local function performAbort(note)
             returnToDockFromCenter()
         end
     elseif pos.x ~= info.x or pos.z ~= info.z then
-        reportError("Abort recovery found the worker away from its dock at Y=0.")
+        reportError("Recovery found the worker away from its dock at Y=0.")
     end
 
     releaseFuelLock()
-    local unloaded = dumpUp()
-    clearJobState()
+    return dumpUp(true)
+end
+
+local function performAbort(note, messageType)
+    local parked = messageType == "worker_parked"
+    paused = false
     abortRequested = false
-    setStatus("docked")
-    send("worker_aborted", {
+    setStatus("aborting")
+    local unloaded = recoverToDockAndUnload()
+    clearJobState()
+    parkRequested = false
+    setStatus(parked and "parked" or "docked")
+    send(messageType or "worker_aborted", {
         note = note or (unloaded and "returned and unloaded" or "returned; output chest was full"),
         position = pos,
     })
 end
 
+
 local function runCalibration(name)
     state.error = nil
-    setStatus("calibrating")
+    setStatus("calibrating", "Tracing and saving the map boundary")
     descendDock(1)
     enterCenterFromDockAtCurrentY()
     turnTo(NORTH)
@@ -933,7 +1207,7 @@ local function runCalibration(name)
     send("calibration_complete", { map = map })
     returnToDockFromCenter()
     dumpUp()
-    setStatus("docked")
+    setStatus("docked", "Docked, unloaded, and ready")
 end
 
 local function runSectionWork(message)
@@ -943,7 +1217,7 @@ local function runSectionWork(message)
     state.firstLayer = message.firstLayer
     state.lastLayer = message.lastLayer
     state.error = nil
-    setStatus("starting")
+    setStatus("starting", "Building route for layers " .. tostring(message.firstLayer) .. "-" .. tostring(message.lastLayer))
 
     validateFuelSlot()
     local route, totalMoves = buildRoute()
@@ -953,15 +1227,28 @@ local function runSectionWork(message)
 
     for layer = message.firstLayer, message.lastLayer do
         safePoint("starting")
-        setStatus("descending")
+        setStatus("descending", "Descending to layer " .. tostring(layer))
         goCenterForLayer(layer)
         excavateLayer(layer, route, totalMoves)
     end
 
     clearJobState()
-    setStatus("docked")
+    setStatus("docked", "Docked, unloaded, and ready")
     send("section_complete", { firstLayer = message.firstLayer, lastLayer = message.lastLayer })
 end
+
+local function recoverAndRetry(message)
+    paused = false
+    abortRequested = false
+    parkRequested = false
+    send("worker_recovery_started", { position = pos })
+    setStatus("recovering", "Returning safely before retrying work")
+    recoverToDockAndUnload()
+    if abortRequested then error(ABORT_SIGNAL, 0) end
+    clearJobState()
+    runSectionWork(message)
+end
+
 
 local function runManagedTask(taskFunction)
     taskActive = true
@@ -988,7 +1275,9 @@ local function runManagedTask(taskFunction)
 end
 
 local function discoverController()
+    setActivity("Searching Rednet for the Roomba controller")
     while not controller do
+        renderWorkerScreen(false)
         local id = rednet.lookup(PROTOCOL, HOSTNAME)
         if id then
             controller = id
@@ -998,6 +1287,7 @@ local function discoverController()
         rednet.broadcast({ type = "hello", version = VERSION, status = state.status, dock = dock }, PROTOCOL)
         sleep(2)
     end
+    setActivity("Connected to controller #" .. tostring(controller))
     send("hello", { status = state.status, fuel = fuelLevel(), position = pos })
 end
 
@@ -1014,13 +1304,13 @@ local function dockProbeLoop()
     end
 end
 
-local function handleAbortWhileIdleOrErrored()
-    if not state.jobId then return end
+local function handleReturnWhileIdleOrErrored(messageType, note)
+    if not dock then return end
     abortRequested = true
-    local ok, err = pcall(function() performAbort("recovered after worker error") end)
+    local ok, err = pcall(function() performAbort(note, messageType) end)
     if not ok then
         state.status = "error"
-        state.error = "Abort recovery failed: " .. tostring(err)
+        state.error = "Return recovery failed: " .. tostring(err)
         persist(true)
         send("worker_error", {
             message = state.error,
@@ -1034,6 +1324,7 @@ local function commandLoop()
     while true do
         local sender, message, protocol = rednet.receive(PROTOCOL, 5)
         if not sender then
+            renderWorkerScreen(false)
             local found = rednet.lookup(PROTOCOL, HOSTNAME)
             if found then controller = found end
             send("heartbeat", {
@@ -1050,12 +1341,13 @@ local function commandLoop()
                 persist(true)
 
             elseif message.type == "dock_assigned" then
+                setActivity("Receiving dock assignment from controller")
                 controller = message.controller
                 dock = message.dock
                 local info = dockInfo[dock]
                 pos = { x = info.x, y = 0, z = info.z, dir = info.out }
                 clearJobState()
-                setStatus("docked")
+                setStatus("docked", "Docked, unloaded, and ready")
                 restoreComputerLabel()
                 send("hello", { status = "docked", fuel = fuelLevel(), position = pos })
 
@@ -1064,6 +1356,7 @@ local function commandLoop()
                 setStatus("dock_conflict")
 
             elseif message.type == "calibrate" then
+                setActivity("Controller requested map calibration")
                 local ok, err = pcall(function()
                     if not dock then reportError("Worker is not dock-assigned.") end
                     runCalibration(message.name)
@@ -1071,6 +1364,7 @@ local function commandLoop()
                 if not ok then printError(err) end
 
             elseif message.type == "start_section" then
+                setActivity("Controller assigned a mining section")
                 if not dock then
                     state.status = "error"
                     state.error = "Worker is not dock-assigned."
@@ -1084,11 +1378,14 @@ local function commandLoop()
                 else
                     paused = false
                     abortRequested = false
+                    parkRequested = false
                     fuelLockGranted = false
                     local ok, err = runManagedTask(function() runSectionWork(message) end)
                     if not ok then
                         if err == ABORT_SIGNAL then
-                            local abortOk, abortErr = pcall(function() performAbort() end)
+                            local messageType = parkRequested and "worker_parked" or "worker_aborted"
+                            local note = parkRequested and "returned by worker command" or nil
+                            local abortOk, abortErr = pcall(function() performAbort(note, messageType) end)
                             if not abortOk then printError(abortErr) end
                         else
                             printError(err)
@@ -1098,29 +1395,70 @@ local function commandLoop()
 
             elseif message.type == "pause" then
                 paused = true
+                setActivity("Pause requested; stopping at the next safe point")
 
             elseif message.type == "resume" then
                 paused = false
+                setActivity("Resume requested")
 
             elseif message.type == "abort" then
-                handleAbortWhileIdleOrErrored()
+                setActivity("Abort requested; returning safely")
+                parkRequested = false
+                handleReturnWhileIdleOrErrored("worker_aborted", "recovered after worker error")
+
+            elseif message.type == "return_to_dock" then
+                setActivity("Return-to-dock command received")
+                parkRequested = true
+                handleReturnWhileIdleOrErrored("worker_parked", "returned by worker command")
+
+            elseif message.type == "recover_and_retry" then
+                setActivity("Recovery and retry command received")
+                if not dock then
+                    reportError("Worker is not dock-assigned for recovery.")
+                else
+                    local ok, err = runManagedTask(function() recoverAndRetry(message) end)
+                    if not ok then
+                        if err == ABORT_SIGNAL then
+                            local messageType = parkRequested and "worker_parked" or "worker_aborted"
+                            local abortOk, abortErr = pcall(function() performAbort("recovery interrupted", messageType) end)
+                            if not abortOk then printError(abortErr) end
+                        else
+                            printError(err)
+                        end
+                    end
+                end
+
+            elseif message.type == "status_request" then
+                send("heartbeat", {
+                    status = state.status,
+                    layer = state.layer,
+                    fuel = fuelLevel(),
+                    position = pos,
+                    progress = state.progress,
+                    total = state.total,
+                })
+
+            elseif message.type == "clear_error" then
+                state.error = nil
+                if pos.y == 0 and dockInfo[dock] and pos.x == dockInfo[dock].x and pos.z == dockInfo[dock].z then
+                    state.status = "docked"
+                end
+                persist(true)
+                send("heartbeat", { status = state.status, fuel = fuelLevel(), position = pos })
             end
         end
     end
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-print("Roomba Hive Worker v" .. VERSION)
-print("ID: " .. tostring(os.getComputerID()))
-print("Modem: " .. modemSide)
-print("Waiting for controller...")
+renderWorkerScreen(true)
 
 local ok, err = pcall(function()
     parallel.waitForAny(dockProbeLoop, commandLoop)
 end)
 if not ok then
-    term.setTextColor(colors.red)
-    printError(err)
-    term.setTextColor(colors.white)
+    state.status = "error"
+    state.error = tostring(err)
+    uiMessage = "Worker program stopped"
+    persist(true)
+    renderWorkerScreen(true)
 end

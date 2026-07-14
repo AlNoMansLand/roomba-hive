@@ -1,6 +1,6 @@
--- Roomba Hive command utility v0.2.0
+-- Roomba Hive command utility v0.2.1
 
-local VERSION = "0.2.0"
+local VERSION = "0.2.1"
 local args = { ... }
 local command = args[1] and args[1]:lower() or "help"
 

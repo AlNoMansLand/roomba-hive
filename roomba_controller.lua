@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.2.0
+-- Roomba Hive Controller v0.2.1
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.2.0"
+local VERSION = "0.2.1"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -10,6 +10,7 @@ local STATE_FILE = fs.combine(ROOT, "state.db")
 local DOCK_SIDES = { "front", "right", "back", "left" }
 local SIDE_TO_DOCK = { front = "north", right = "east", back = "south", left = "west" }
 local DOCK_ORDER = { "north", "east", "south", "west" }
+local DOCK_DISPLAY = { north = "front", east = "right", south = "back", west = "left" }
 local PULSE_SECONDS = 0.75
 local HEARTBEAT_TIMEOUT = 30
 local ABORT_RETRY_SECONDS = 5
@@ -160,9 +161,17 @@ local function restoreReportedDock(sender, reportedDock, worker)
     return true
 end
 
+local function displayDock(dock)
+    return dock and (DOCK_DISPLAY[dock] or dock) or "unassigned"
+end
+
+local function titleCase(value)
+    value = tostring(value or "")
+    return value:sub(1, 1):upper() .. value:sub(2)
+end
+
 local function workerLabel(worker)
-    local dockName = worker.dock and (worker.dock:sub(1, 1):upper() .. worker.dock:sub(2)) or "Unassigned"
-    return dockName .. " #" .. tostring(worker.id)
+    return titleCase(displayDock(worker.dock)) .. " #" .. tostring(worker.id)
 end
 
 local function isActiveJob()
@@ -188,12 +197,12 @@ local function render()
         local worker = id and state.workers[tostring(id)] or nil
         if occupied and worker then
             local age = worker.lastSeen and math.floor((os.epoch("utc") - worker.lastSeen) / 1000) or 9999
-            print(string.format("%-5s #%-4s %-14s %ss", dock, id, worker.status or "unknown", age))
+            print(string.format("%-5s #%-4s %-14s %ss", displayDock(dock), id, worker.status or "unknown", age))
         elseif assigned then
             local status = worker and worker.status or "assigned"
-            print(string.format("%-5s #%-4s %-14s away", dock, assigned, status))
+            print(string.format("%-5s #%-4s %-14s away", displayDock(dock), assigned, status))
         else
-            print(string.format("%-5s empty", dock))
+            print(string.format("%-5s empty", displayDock(dock)))
         end
     end
 
@@ -224,7 +233,7 @@ local function detectDocks()
     state.dockOccupancy = {}
     for _, side in ipairs(DOCK_SIDES) do
         local dock = SIDE_TO_DOCK[side]
-        print("Probing " .. dock .. " dock...")
+        print("Probing " .. displayDock(dock) .. " dock...")
         activeProbeDock = dock
         redstone.setOutput(side, true)
         broadcast("dock_probe_begin", { dock = dock, controller = os.getComputerID() })
@@ -252,7 +261,7 @@ local function chooseDockedWorker()
         return nil
     end
     for index, choice in ipairs(choices) do
-        print(index .. ") " .. choice.dock .. " turtle #" .. tostring(choice.id))
+        print(index .. ") " .. displayDock(choice.dock) .. " turtle #" .. tostring(choice.id))
     end
     write("Choose worker: ")
     return choices[tonumber(read())]
@@ -535,10 +544,13 @@ local function handleMessage(sender, message)
         worker.position = message.position or worker.position
         worker.progress = message.progress or worker.progress
         worker.total = message.total or worker.total
+        if message.status and message.status ~= "error" and message.status ~= "blocked_waiting" then
+            worker.error = nil
+        end
         local restored = restoreReportedDock(sender, message.dock, worker)
-        if (message.status == "docked" or message.status == "aborted") and restored then
+        if (message.status == "docked" or message.status == "aborted" or message.status == "parked") and restored then
             state.dockOccupancy[message.dock] = sender
-        elseif message.status and message.status ~= "docked" and message.status ~= "aborted" then
+        elseif message.status and message.status ~= "docked" and message.status ~= "aborted" and message.status ~= "parked" then
             for dockName, id in pairs(state.dockOccupancy) do
                 if tostring(id) == tostring(sender) then state.dockOccupancy[dockName] = nil end
             end
@@ -569,11 +581,33 @@ local function handleMessage(sender, message)
     elseif message.type == "worker_aborted" then
         worker.status = "docked"
         worker.layer = nil
+        worker.error = nil
         worker.abortNote = message.note
         if validDock(worker.dock) and tostring(state.docks[worker.dock]) == tostring(sender) then
             state.dockOccupancy[worker.dock] = sender
         end
         acknowledgeAbort(sender)
+
+    elseif message.type == "worker_parked" then
+        worker.status = "parked"
+        worker.layer = nil
+        worker.error = nil
+        worker.abortNote = message.note
+        if validDock(worker.dock) and tostring(state.docks[worker.dock]) == tostring(sender) then
+            state.dockOccupancy[worker.dock] = sender
+        end
+
+    elseif message.type == "worker_recovery_started" then
+        worker.status = "recovering"
+        worker.error = nil
+
+    elseif message.type == "worker_blocked" then
+        worker.status = "blocked_waiting"
+        worker.error = {
+            message = message.message,
+            position = message.position,
+            recoverable = true,
+        }
 
     elseif message.type == "worker_error" then
         worker.status = "ERROR: " .. tostring(message.message)
@@ -601,24 +635,222 @@ local function handleMessage(sender, message)
     saveState()
 end
 
-local function workersView()
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("WORKERS")
+local function sortedWorkers()
     local workers = {}
     for _, worker in pairs(state.workers) do workers[#workers + 1] = worker end
-    table.sort(workers, function(a, b) return tostring(a.dock or "z") < tostring(b.dock or "z") end)
-    for _, worker in ipairs(workers) do
-        print(workerLabel(worker) .. " | " .. tostring(worker.status) .. " | L" .. tostring(worker.layer or "-") .. " | F" .. tostring(worker.fuel or "?"))
-        if worker.progress and worker.total then
-            print("  Progress " .. tostring(worker.progress) .. "/" .. tostring(worker.total))
-        end
-        if worker.error then
-            print("  " .. tostring(worker.error.message) .. " @ " .. textutils.serialize(worker.error.position or {}))
+    table.sort(workers, function(a, b)
+        local ad = displayDock(a.dock)
+        local bd = displayDock(b.dock)
+        if ad == bd then return tonumber(a.id) < tonumber(b.id) end
+        return ad < bd
+    end)
+    return workers
+end
+
+local function findWorkerSection(workerId)
+    if not state.job then return nil end
+    for _, section in ipairs(state.job.sections or {}) do
+        if tostring(section.worker) == tostring(workerId) then return section end
+    end
+    return nil
+end
+
+local function firstIncompleteLayer(section)
+    if not state.job or not section then return nil end
+    for layer = section.first, section.last do
+        if not state.job.layerState or state.job.layerState[layer] ~= "complete" then return layer end
+    end
+    return nil
+end
+
+local function assignmentForWorker(worker)
+    if not state.job then return nil, "No job is recorded." end
+    if state.job.status == "complete" or state.job.status == "aborted" or state.job.status == "aborting" then
+        return nil, "The recorded job is already " .. tostring(state.job.status) .. "."
+    end
+    if state.job.status == "paused" then
+        return nil, "Resume the job before restarting worker operations."
+    end
+    local section = findWorkerSection(worker.id)
+    if not section then return nil, "This worker has no section in the current job." end
+    local first = firstIncompleteLayer(section)
+    if not first then return nil, "This worker's assigned layers are already complete." end
+    local map = loadMap(state.job.mapName)
+    if not map then return nil, "The job map could not be loaded." end
+    return {
+        jobId = state.job.id,
+        map = map,
+        firstLayer = first,
+        lastLayer = section.last,
+        dock = section.dock,
+    }
+end
+
+local function markWorkerLayersAssigned(worker)
+    local section = findWorkerSection(worker.id)
+    local first = firstIncompleteLayer(section)
+    if not section or not first or not state.job or not state.job.layerState then return end
+    for layer = first, section.last do
+        if state.job.layerState[layer] ~= "complete" then state.job.layerState[layer] = "assigned" end
+    end
+end
+
+local function workerDetails(worker)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("WORKER " .. workerLabel(worker))
+    print(string.rep("=", 30))
+    print("ID: " .. tostring(worker.id))
+    print("Physical dock: " .. titleCase(displayDock(worker.dock)))
+    print("Logical dock: " .. tostring(worker.dock or "unassigned"))
+    print("Status: " .. tostring(worker.status or "unknown"))
+    print("Layer: " .. tostring(worker.layer or "-"))
+    print("Fuel: " .. tostring(worker.fuel or "?"))
+    if worker.position then print("Position: " .. textutils.serialize(worker.position)) end
+    if worker.progress and worker.total then print("Progress: " .. tostring(worker.progress) .. "/" .. tostring(worker.total)) end
+    if worker.error then
+        print("")
+        print("Last problem:")
+        print(tostring(worker.error.message or worker.error))
+        if worker.error.position then print(textutils.serialize(worker.error.position)) end
+    end
+    print("")
+    print("1) Refresh / ping")
+    print("2) Recover and retry remaining work")
+    print("3) Return to dock and stop")
+    print("4) Pause this worker")
+    print("5) Resume this worker")
+    print("6) Restart remaining work from dock")
+    print("7) Clear displayed error")
+    print("8) Forget this worker record")
+    print("0) Back")
+    write("Choose: ")
+end
+
+local function manageWorker(worker)
+    while true do
+        worker = state.workers[tostring(worker.id)] or worker
+        workerDetails(worker)
+        local choice = read()
+        if choice == "0" or choice == "" then return
+
+        elseif choice == "1" then
+            send(worker.id, "status_request", {})
+            print("Status request sent.")
+            sleep(1)
+
+        elseif choice == "2" then
+            local assignment, err = assignmentForWorker(worker)
+            if not assignment then
+                print(err)
+                sleep(2)
+            else
+                print("This returns the worker to its dock, unloads, then restarts at layer " .. tostring(assignment.firstLayer) .. ".")
+                print("The partially mined layer may be traversed again, but already empty blocks are not re-mined.")
+                write("Type RETRY: ")
+                if read() == "RETRY" then
+                    markWorkerLayersAssigned(worker)
+                    worker.status = "recovering"
+                    worker.error = nil
+                    saveState()
+                    send(worker.id, "recover_and_retry", assignment)
+                    print("Recovery and retry command sent.")
+                    sleep(2)
+                end
+            end
+
+        elseif choice == "3" then
+            print("The worker will return through its known carved route, unload, and wait at the dock.")
+            write("Type RETURN: ")
+            if read() == "RETURN" then
+                worker.status = "returning_by_command"
+                saveState()
+                send(worker.id, "return_to_dock", { jobId = state.job and state.job.id or nil })
+                print("Return command sent.")
+                sleep(2)
+            end
+
+        elseif choice == "4" then
+            send(worker.id, "pause", { jobId = state.job and state.job.id or nil })
+            worker.status = "pause_requested"
+            saveState()
+            sleep(1)
+
+        elseif choice == "5" then
+            send(worker.id, "resume", { jobId = state.job and state.job.id or nil })
+            worker.status = "resume_requested"
+            saveState()
+            sleep(1)
+
+        elseif choice == "6" then
+            local assignment, err = assignmentForWorker(worker)
+            if not assignment then
+                print(err)
+                sleep(2)
+            elseif worker.status ~= "docked" and worker.status ~= "parked" and worker.status ~= "aborted" then
+                print("Use Recover and retry unless the worker is physically docked.")
+                sleep(2)
+            else
+                markWorkerLayersAssigned(worker)
+                worker.status = "starting"
+                worker.error = nil
+                saveState()
+                send(worker.id, "start_section", assignment)
+                print("Remaining section resent from layer " .. tostring(assignment.firstLayer) .. ".")
+                sleep(2)
+            end
+
+        elseif choice == "7" then
+            worker.error = nil
+            saveState()
+            send(worker.id, "clear_error", {})
+            print("Displayed error cleared.")
+            sleep(1)
+
+        elseif choice == "8" then
+            if findWorkerSection(worker.id) and isActiveJob() then
+                print("This worker belongs to the active job and cannot be forgotten yet.")
+                sleep(2)
+            else
+                write("Type FORGET: ")
+                if read() == "FORGET" then
+                    for dockName, id in pairs(state.docks) do
+                        if tostring(id) == tostring(worker.id) then state.docks[dockName] = nil end
+                    end
+                    for dockName, id in pairs(state.dockOccupancy) do
+                        if tostring(id) == tostring(worker.id) then state.dockOccupancy[dockName] = nil end
+                    end
+                    state.workers[tostring(worker.id)] = nil
+                    saveState()
+                    return
+                end
+            end
         end
     end
-    print("\nPress Enter.")
-    read()
+end
+
+local function workersView()
+    while true do
+        term.clear()
+        term.setCursorPos(1, 1)
+        print("WORKERS")
+        print(string.rep("=", 30))
+        local workers = sortedWorkers()
+        if #workers == 0 then
+            print("No workers have reported yet.")
+            print("\nPress Enter.")
+            read()
+            return
+        end
+        for index, worker in ipairs(workers) do
+            print(index .. ") " .. workerLabel(worker) .. " | " .. tostring(worker.status or "unknown") .. " | L" .. tostring(worker.layer or "-") .. " | F" .. tostring(worker.fuel or "?"))
+        end
+        print("0) Back")
+        write("Select worker: ")
+        local selected = tonumber(read())
+        if not selected or selected == 0 then return end
+        if workers[selected] then manageWorker(workers[selected]) end
+    end
 end
 
 local function mapsView()
