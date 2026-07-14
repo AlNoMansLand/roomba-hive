@@ -29,6 +29,14 @@ local function replaceOnce(old, new, label)
     source = source:sub(1, startPos - 1) .. new .. source:sub(endPos + 1)
 end
 
+local function replacePattern(pattern, new, label)
+    local count
+    source, count = source:gsub(pattern, new, 1)
+    if count ~= 1 then
+        error("Patch failed (" .. label .. "): flexible source pattern was not found.", 0)
+    end
+end
+
 if role == "controller" then
     replaceOnce(
         '-- Roomba Hive Controller v0.1.1',
@@ -132,9 +140,9 @@ elseif role == "worker" then
         "worker control flags"
     )
 
-    replaceOnce(
-        ' while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>0 do',
-        '  while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>FUEL_ITEM_RESERVE do',
+    replacePattern(
+        '%s+while fuelLevel%(%)[<]target and turtle%.getItemCount%(FUEL_SLOT%)[>]0 do',
+        '\n  while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>FUEL_ITEM_RESERVE do',
         "preserve five fuel items"
     )
 
