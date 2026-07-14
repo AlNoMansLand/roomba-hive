@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.1.0
+-- Roomba Hive Controller v0.1.1
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.1.0"
+local VERSION = "0.1.1"
 local PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local ROOT = "/roomba"
@@ -51,11 +51,14 @@ local state = loadTable(STATE_FILE) or {
     maps = {},
     workers = {},
     docks = {},
+    dockOccupancy = {},
     job = nil,
     fuelLock = nil,
 }
 state.workers = state.workers or {}
 state.docks = state.docks or {}
+-- Physical occupancy is deliberately ephemeral and independent from saved assignments.
+state.dockOccupancy = {}
 
 local function saveState() atomicSave(STATE_FILE, state) end
 
@@ -116,6 +119,42 @@ local function workerLabel(w)
     return (w.dock and w.dock:sub(1,1):upper() .. w.dock:sub(2) or "Unassigned") .. " #" .. tostring(w.id)
 end
 
+local function validDock(dock)
+    for _, name in ipairs(DOCK_ORDER) do
+        if dock == name then return true end
+    end
+    return false
+end
+
+local function workerIsActive(id)
+    local worker = state.workers[tostring(id)]
+    if not worker or not worker.lastSeen then return false end
+    return os.epoch("utc") - worker.lastSeen <= HEARTBEAT_TIMEOUT * 1000
+        and not tostring(worker.status or ""):find("^offline")
+end
+
+local function restoreReportedDock(sender, reportedDock, worker)
+    if not validDock(reportedDock) then return false end
+    local assigned = state.docks[reportedDock]
+    if assigned and tostring(assigned) ~= tostring(sender) and workerIsActive(assigned) then
+        return false
+    end
+
+    for dockName, id in pairs(state.docks) do
+        if dockName ~= reportedDock and tostring(id) == tostring(sender) then
+            state.docks[dockName] = nil
+        end
+    end
+    if assigned and tostring(assigned) ~= tostring(sender) then
+        local displaced = state.workers[tostring(assigned)]
+        if displaced and displaced.dock == reportedDock then displaced.dock = nil end
+    end
+
+    state.docks[reportedDock] = sender
+    worker.dock = reportedDock
+    return true
+end
+
 local function render()
     term.clear(); term.setCursorPos(1,1)
     print("ROOOMBA HIVE CONTROLLER v" .. VERSION)
@@ -123,11 +162,15 @@ local function render()
     print("Modem: " .. modemSide)
     print("")
     for _, dock in ipairs(DOCK_ORDER) do
-        local id = state.docks[dock]
+        local occupied = state.dockOccupancy[dock]
+        local assigned = state.docks[dock]
+        local id = occupied or assigned
         local w = id and state.workers[tostring(id)] or nil
-        if w then
+        if occupied and w then
             local age = w.lastSeen and math.floor((os.epoch("utc") - w.lastSeen) / 1000) or 9999
             print(string.format("%-5s  #%-4s %-16s %ss", dock, id, w.status or "unknown", age))
+        elseif assigned then
+            print(string.format("%-5s  assigned #%-4s (not occupied)", dock, assigned))
         else
             print(string.format("%-5s  empty", dock))
         end
@@ -147,8 +190,13 @@ local function render()
 end
 
 local function detectDocks()
+    if state.job and (state.job.status == "running" or state.job.status == "paused") then
+        print("\nDock detection is disabled while a job is running or paused.")
+        sleep(2)
+        return
+    end
     print("\nMake sure worker turtles are powered on, touching the four horizontal sides, and facing outward.")
-    state.docks = {}
+    state.dockOccupancy = {}
     for _, side in ipairs(DOCK_SIDES) do
         local dock = SIDE_TO_DOCK[side]
         print("Probing " .. dock .. " dock...")
@@ -158,7 +206,7 @@ local function detectDocks()
         sleep(PULSE_SECONDS)
         redstone.setOutput(side, false)
         activeProbeDock = nil
-        local found = state.docks[dock]
+        local found = state.dockOccupancy[dock]
         if found then
             print("  Found turtle #" .. found)
         else
@@ -174,7 +222,7 @@ end
 local function chooseDockedWorker()
     local choices = {}
     for _, dock in ipairs(DOCK_ORDER) do
-        local id = state.docks[dock]
+        local id = state.dockOccupancy[dock]
         if id then choices[#choices+1] = {dock=dock,id=id} end
     end
     if #choices == 0 then print("No docked workers. Run Detect docks first."); sleep(2); return nil end
@@ -235,7 +283,7 @@ local function startJob()
     if not layers or layers < 1 or layers % 1 ~= 0 then print("Invalid layers."); sleep(2); return end
     local workers = {}
     for _,dock in ipairs(DOCK_ORDER) do
-        local id = state.docks[dock]
+        local id = state.dockOccupancy[dock]
         if id then workers[#workers+1] = {id=id,dock=dock} end
     end
     if #workers == 0 then print("No workers detected."); sleep(2); return end
@@ -251,6 +299,7 @@ local function startJob()
     for _,s in ipairs(sections) do
         for l=s.first,s.last do layerState[l] = "assigned" end
         send(s.worker, "start_section", { jobId=state.job.id, map=map, firstLayer=s.first, lastLayer=s.last, dock=s.dock })
+        state.dockOccupancy[s.dock] = nil
     end
     saveState()
     print("Job started across " .. #sections .. " worker(s). Press Enter."); read()
@@ -263,10 +312,14 @@ local function handleMessage(sender, msg)
     w.lastSeen = os.epoch("utc")
     if msg.type == "dock_probe" and activeProbeDock then
         local dockName = activeProbeDock
-        state.docks[dockName] = sender
-        w.dock = dockName
-        w.status = "docked"
-        send(sender, "dock_assigned", { dock = dockName, controller = os.getComputerID() })
+        state.dockOccupancy[dockName] = sender
+        if restoreReportedDock(sender, dockName, w) then
+            w.status = "docked"
+            send(sender, "dock_assigned", { dock = dockName, controller = os.getComputerID() })
+        else
+            w.status = "dock conflict"
+            send(sender, "dock_conflict", { dock = dockName, assignedTo = state.docks[dockName] })
+        end
     elseif msg.type == "calibration_complete" and state.pendingCalibration and sender == state.pendingCalibration.worker then
         msg.map.name = state.pendingCalibration.name
         saveMap(msg.map)
@@ -277,6 +330,14 @@ local function handleMessage(sender, msg)
         w.layer = msg.layer or w.layer
         w.fuel = msg.fuel or w.fuel
         w.position = msg.position or w.position
+        local restored = restoreReportedDock(sender, msg.dock, w)
+        if msg.status == "docked" and restored then
+            state.dockOccupancy[msg.dock] = sender
+        elseif msg.status and msg.status ~= "docked" then
+            for dockName, id in pairs(state.dockOccupancy) do
+                if tostring(id) == tostring(sender) then state.dockOccupancy[dockName] = nil end
+            end
+        end
         state.workers[key] = w
     elseif msg.type == "layer_started" then
         w.status = "mining"; w.layer = msg.layer
@@ -290,6 +351,9 @@ local function handleMessage(sender, msg)
         end
     elseif msg.type == "section_complete" then
         w.status = "docked"; w.layer=nil
+        if validDock(w.dock) and tostring(state.docks[w.dock]) == tostring(sender) then
+            state.dockOccupancy[w.dock] = sender
+        end
     elseif msg.type == "worker_error" then
         w.status = "ERROR: " .. tostring(msg.message)
         w.error = msg
