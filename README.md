@@ -1,10 +1,17 @@
-# Roomba Hive v0.1.0
+# Roomba Hive v0.1.1
 
 A multi-turtle CC:Tweaked excavator based on the proven single-turtle `roomba.lua` calibration and sweep design.
 
 ## Status
 
-This is the first implementation build. Test it in a small disposable quarry before trusting it with a large excavation. The package has not yet been executed inside Minecraft in this environment.
+This is an early implementation build. Test it in a small disposable quarry before trusting it with a large excavation. The package has not yet been executed inside Minecraft in this environment.
+
+## v0.1.1
+
+- Dock detection is blocked while a job is running or paused, so active assignments cannot be erased.
+- The controller now tracks remembered dock assignments separately from current physical occupancy.
+- Workers restore their saved dock label after reboot and include the saved dock in hello and heartbeat messages.
+- The controller accepts a worker's valid saved assignment unless that dock belongs to another active worker.
 
 ## Required base layout
 
@@ -70,13 +77,13 @@ The installer creates `/startup.lua`, so the program launches after every reboot
 ## Hazard behavior
 
 - Water: the worker continues; the excavation may flood.
-- Lava: current v0.1 does not yet have reliable fluid-source detection. Supervise lava-prone jobs.
+- Lava: current v0.1.1 does not yet have reliable fluid-source detection. Supervise lava-prone jobs.
 - Entity: wait 5 seconds, attack exactly once, retry once, then stop and report.
 - Inventories, computers and turtles: protected and never deliberately mined.
 - Falling blocks: repeatedly mined up to a safety limit.
 - Undiggable blocks: stop and report.
 
-## Important v0.1 limitations
+## Important v0.1.1 limitations
 
 - Fixed contiguous layer sections are assigned to up to four docked workers.
 - Do not add extra workers to an occupied shaft.
