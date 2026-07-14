@@ -133,7 +133,7 @@ elseif role == "worker" then
     )
 
     replaceOnce(
-        '  while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>0 do',
+        ' while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>0 do',
         '  while fuelLevel()<target and turtle.getItemCount(FUEL_SLOT)>FUEL_ITEM_RESERVE do',
         "preserve five fuel items"
     )
