@@ -1,17 +1,16 @@
-# Roomba Hive v0.3.1
+# Roomba Hive v0.3.2
 
 Roomba Hive is a coordinated quarry system for **CC:Tweaked**. One Advanced Computer manages up to four mining turtles, while an optional Advanced Wireless or Ender Pocket Computer provides a secure remote dashboard.
 
 The project is designed around safe recovery rather than blind movement. Workers report their state, preserve fuel, queue updates until they are docked, and refuse automatic movement when their saved position is not trustworthy.
 
-## What v0.3.1 changes
+## What v0.3.2 changes
 
-- Simplified the controller dashboard into six grouped categories.
-- Replaced the pocket's crowded two-column menu with a readable one-column dashboard.
-- Added context-aware Pocket Quick Actions.
-- Added automatic pocket status refresh every five seconds while the home screen is open.
-- Corrected player-facing left/right dock labels when looking at the controller screen.
-- Preserved the internal dock coordinates, saved maps, pairings, checkpoints, and job state.
+- Changed the one-layer test from mandatory to optional.
+- Untested maps now show a recommendation instead of blocking quarry startup.
+- Controller-started and pocket-started jobs both continue through mandatory preflight without test approval.
+- The test remains available and still records a successful check for the current hive location.
+- No maps, jobs, pairings, assignments, or checkpoints are reset by this update.
 
 ## Core v0.3 features
 
@@ -235,7 +234,7 @@ Uploading a file with the same exact name and path replaces the current reposito
 ## Clean controller installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 controller
 ```
 
 ## Clean worker installation
@@ -243,13 +242,13 @@ wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install
 Run this on every turtle:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 worker
 ```
 
 ## Pocket installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 pocket
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 pocket
 ```
 
 ## Updating from v0.3.0 or later
@@ -258,14 +257,14 @@ The safest migration is:
 
 1. Finish or safely abort the current quarry job.
 2. Confirm all workers are physically docked.
-3. Upload every v0.3.1 file to GitHub.
+3. Upload every v0.3.2 file to GitHub.
 4. From the existing controller choose `Operations > Safe update hive`, or use `Quick Actions > Safe update hive` on an Administrator pocket. You may also stop the controller UI and run:
 
 ```text
 roomba update
 ```
 
-The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.1, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
+The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.2, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
 
 A worker that is offline or whose program has fully stopped cannot receive the request. Use the manual worker command above for that turtle.
 
@@ -278,7 +277,7 @@ roomba reset
 Remote installer form:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 reset
 ```
 
 Factory reset deletes programs, maps, jobs, backups, pairings, labels, and device state. It is **not** required for normal updates, relocation, or moving the quarry downward.
@@ -320,7 +319,7 @@ Choose one docked worker, name the map, and confirm calibration. The selected wo
 
 Calibration does not mine every block in the quarry. It records the horizontal footprint that every later layer will use.
 
-## Step 4: Run a one-layer test
+## Step 4: Optionally run a one-layer test
 
 Press:
 
@@ -330,9 +329,9 @@ T
 
 The test run uses one worker and one layer. It verifies the map orientation, shaft, output chest, fuel route, return path, and basic inventory flow with limited risk.
 
-A successful test is required before a full quarry job. Passing the test unlocks that map for the current hive location.
+The test is optional. Passing it records that the map has been checked at the current hive location, but an untested map may still start a full quarry after its normal preflight passes.
 
-Relocation or backup restoration advances the controller's site generation and invalidates earlier test approval. This prevents a map tested at one physical build from silently authorising a large job after the hive has moved.
+Relocation or backup restoration advances the controller's site generation and marks earlier test approval as no longer current. This is informational and does not block operation.
 
 ## Step 5: Start the full job
 
@@ -348,7 +347,7 @@ Choose the map and number of layers. The controller performs preflight, displays
 
 # 6. Controller interface
 
-The v0.3.1 home screen is intentionally small and groups related actions:
+The v0.3.2 home screen is intentionally small and groups related actions:
 
 ```text
 1  Operations
@@ -374,7 +373,7 @@ Select a worker to inspect its status, fuel, storage, version, position confiden
 ## Jobs & Maps
 
 - Start a quarry job.
-- Run the required one-layer test.
+- Run the optional one-layer safety test.
 - Calibrate a new map.
 - View saved maps.
 - Import a legacy map.
@@ -414,7 +413,7 @@ Every full job and test run starts with preflight. The controller checks each se
 
 Warnings do not always block a job. For example, a five-item fuel reserve produces a warning because the shared station must be stocked.
 
-Preflight cannot prove that every future underground block or every modded machine will behave correctly. The controller therefore requires a successful one-layer test before it allows a full job.
+Preflight cannot prove that every future underground block or every modded machine will behave correctly. A one-layer test is strongly recommended, especially after calibration or relocation, but it is not required to start a full job.
 
 ---
 
@@ -619,7 +618,7 @@ Move the controller level to Y=80. The next job's layer 1 is then Y=79, directly
 6. Preserve the same relative layout and controller orientation when reusing the same map.
 7. Start all devices.
 8. Press `D` on the controller to detect the new physical docks.
-9. Run and pass a new one-layer test; relocation invalidates the previous site approval.
+9. Optionally run a new one-layer test; relocation marks the previous site approval as no longer current.
 
 Relocation preserves:
 
@@ -921,11 +920,11 @@ Do not force an underground movement command. Manually recover the turtle to its
 Before using valuable terrain:
 
 1. Build the controller with one worker and small output chest.
-2. Install v0.3.1 on controller and worker.
+2. Install v0.3.2 on controller and worker.
 3. Detect the dock.
 4. Calibrate a small disposable closed outline.
 5. Run preflight and confirm the 80-units-per-coal estimate appears.
-6. Run the one-layer test.
+6. Optionally run the one-layer test.
 7. Confirm identical drops stack normally without a delay after every block.
 8. Fill several storage slots and confirm the worker unloads.
 9. Empty the fuel station and confirm the worker returns showing `RESTOCK FUEL STATION`.

@@ -1,6 +1,15 @@
 # Changelog
 
-## v0.3.1
+## v0.3.2
+
+- Changed the one-layer test from a startup requirement to an optional safety check.
+- Untested maps now show `UNTESTED (OPTIONAL)` on the controller and `UNTESTED` on the pocket.
+- Local and pocket-started jobs no longer fail solely because a map has not passed a test.
+- Untested jobs still run mandatory preflight and display a recommendation before startup.
+- Successful tests continue to be recorded for the current hive location.
+- No protocol or data migration is required.
+
+## v0.3.2
 
 - Replaced the crowded controller shortcut wall with six grouped menu categories.
 - Replaced the pocket's two-column home screen with a readable one-column dashboard.

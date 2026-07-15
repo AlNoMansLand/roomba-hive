@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.3.1
+-- Roomba Hive Controller v0.3.2
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.3.1"
+local VERSION = "0.3.2"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -743,10 +743,9 @@ local function jobWizard(testRun)
     local map = loadMap(name)
     if not map then print("Map file could not be loaded."); sleep(2); return end
     if not testRun and not mapTestedForCurrentSite(name) then
-        print("This map has not passed a one-layer test at the current hive location.")
-        print("Run T first. Relocation intentionally invalidates the previous test approval.")
-        sleep(3)
-        return
+        print("\nOPTIONAL SAFETY TEST NOT PASSED")
+        print("A one-layer test is recommended for this map and hive location,")
+        print("but it is not required. The normal preflight will still run.")
     end
     local estimate = estimateFuel(map, layers, math.min(layers, #workers))
     print("\nQUARRY ESTIMATE")
@@ -1359,7 +1358,7 @@ local function mapsView()
     if #maps == 0 then print("No maps saved.") end
     for _, name in ipairs(maps) do
         local map = loadMap(name)
-        local testStatus = mapTestedForCurrentSite(name) and "TESTED" or "TEST REQUIRED"
+        local testStatus = mapTestedForCurrentSite(name) and "TESTED" or "UNTESTED (OPTIONAL)"
         print(name .. " | " .. tostring(map and countMapCells(map) or "?") .. " cells | " .. testStatus)
     end
     print("\nPress Enter.")
@@ -1834,7 +1833,7 @@ local function jobsAndMapsMenu()
     while true do
         menuHeader("JOBS & MAPS")
         print("1  Start quarry job")
-        print("2  One-layer test")
+        print("2  Optional one-layer test")
         print("3  Calibrate new map")
         print("4  View saved maps")
         print("5  Import legacy map")
@@ -1975,9 +1974,6 @@ local function remotePreflight(params)
     if not mapName or not layers or layers < 1 then return false, "Map name and positive layer count are required." end
     local map = loadMap(mapName)
     if not map then return false, "Map not found." end
-    if not (params and params.testRun) and not mapTestedForCurrentSite(mapName) then
-        return false, "Run a one-layer test for this map at the current hive location first."
-    end
     local workers = {}
     if type(params.workerIds) == "table" and #params.workerIds > 0 then
         for _, id in ipairs(params.workerIds) do
@@ -1994,14 +1990,15 @@ local function remotePreflight(params)
     if params.testRun and #workers > 1 then workers = { workers[1] }; layers = 1 end
     if #workers == 0 then return false, "No docked workers." end
     startPreflight(workers, mapName, layers, params.testRun and "test" or "remote")
-    return true, { requestId = state.preflight.id, estimate = estimateFuel(map, layers, math.min(layers, #workers)) }
+    return true, {
+        requestId = state.preflight.id,
+        estimate = estimateFuel(map, layers, math.min(layers, #workers)),
+        testRecommended = not (params and params.testRun) and not mapTestedForCurrentSite(mapName),
+    }
 end
 
 local function remoteStartJob(params)
     if isActiveJob() then return false, "A job is already active." end
-    if not (params and params.testRun) and not mapTestedForCurrentSite(params and params.mapName) then
-        return false, "The map has not passed a one-layer test at the current hive location."
-    end
     local preflight = state.preflight
     if not preflight or preflight.mapName ~= params.mapName or tonumber(preflight.layers) ~= tonumber(params.layers) then
         return false, "Run a matching preflight first."

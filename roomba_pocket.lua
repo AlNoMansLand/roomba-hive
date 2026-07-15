@@ -1,7 +1,7 @@
--- Roomba Hive Pocket v0.3.1
+-- Roomba Hive Pocket v0.3.2
 -- Secure remote dashboard for an Advanced Wireless/Ender Pocket Computer.
 
-local VERSION = "0.3.1"
+local VERSION = "0.3.2"
 local PROTOCOL_VERSION = 2
 local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
@@ -409,6 +409,11 @@ local function waitForPreflight(mapName, layers, testRun)
     print("Minimum: " .. tostring(estimate.minimumUnits) .. " fuel (~" .. tostring(estimate.minimumCoal) .. " coal)")
     print("Recommended: " .. tostring(estimate.recommendedUnits) .. " fuel (~" .. tostring(estimate.recommendedCoal) .. " coal)")
     print("Coal estimate uses " .. tostring(estimate.fuelPerItem or 80) .. " units/item.")
+    if started.testRecommended then
+        print("")
+        print("Optional test not passed.")
+        print("You may continue after preflight, but a one-layer test is recommended.")
+    end
     local deadline = os.epoch("utc") + 12000
     while os.epoch("utc") < deadline do
         local statusOk, result = remoteRequest("preflight_status", {}, 3)
@@ -430,7 +435,7 @@ local function jobsMenu()
     while true do
         clear("JOBS AND MAPS")
         print("1) Start quarry job")
-        print("2) One-layer test run")
+        print("2) Optional one-layer test")
         print("3) View maps")
         print("4) Job history")
         print("0) Back")
@@ -441,7 +446,7 @@ local function jobsMenu()
             if not ok then printError(err); sleep(2)
             else
                 for index, map in ipairs(maps or {}) do
-                    print(index .. ") " .. tostring(map.name) .. " | " .. (map.tested and "TESTED" or "TEST REQUIRED"))
+                    print(index .. ") " .. tostring(map.name) .. " | " .. (map.tested and "TESTED" or "UNTESTED"))
                 end
                 local selectedMap = maps[tonumber(prompt("Map: "))]
                 local mapName = selectedMap and selectedMap.name or nil
@@ -467,7 +472,7 @@ local function jobsMenu()
             clear("MAP LIBRARY")
             if not ok then printError(err) else
                 for _, map in ipairs(maps or {}) do
-                    print(tostring(map.name) .. " | " .. tostring(map.cellCount or "?") .. " cells | " .. (map.tested and "TESTED" or "TEST REQUIRED"))
+                    print(tostring(map.name) .. " | " .. tostring(map.cellCount or "?") .. " cells | " .. (map.tested and "TESTED" or "UNTESTED"))
                 end
             end
             print("Press Enter."); read()
