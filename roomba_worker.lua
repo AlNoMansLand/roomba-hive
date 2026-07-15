@@ -1,12 +1,15 @@
--- Roomba Hive Worker v0.2.3
+-- Roomba Hive Worker v0.3.0
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.2.3"
-local PROTOCOL = "roomba_hive_v1"
+local VERSION = "0.3.0"
+local PROTOCOL_VERSION = 2
+local PROTOCOL = "roomba_hive_worker_v2"
+local LEGACY_PROTOCOL = "roomba_hive_v1"
 local HOSTNAME = "roomba-hive"
 local UPDATE_BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
 local ROOT = "/roomba"
 local STATE_FILE = fs.combine(ROOT, "worker_state.db")
+local BOOT_FILE = fs.combine(ROOT, "boot.lua")
 
 local FUEL_SLOT = 1
 local FIRST_STORAGE_SLOT = 2
@@ -81,10 +84,38 @@ local function loadTable(path)
 end
 
 local state = loadTable(STATE_FILE) or { status = "unassigned" }
+state.protocolVersion = PROTOCOL_VERSION
+state.positionConfidence = state.positionConfidence or "unknown"
+state.alerts = state.alerts or {}
 local controller = state.controller
 local dock = state.dock
 local pos = state.pos or { x = 0, y = 0, z = 0, dir = NORTH }
 local movesSinceSave = 0
+
+local function atDockCoordinates()
+    local info = dock and dockInfo[dock] or nil
+    return info ~= nil and pos.y == 0 and pos.x == info.x and pos.z == info.z
+end
+
+-- Crash recovery is deliberately conservative. Only a position explicitly
+-- persisted while stationary at the layer centre is considered recoverable.
+-- A crash during any movement leaves confidence unknown, even when the saved
+-- coordinates happen to resemble a shaft position.
+if atDockCoordinates() then
+    state.positionConfidence = "confirmed"
+    state.recoveryAnchor = "dock"
+elseif state.jobId then
+    if state.positionConfidence == "recoverable" and state.recoveryAnchor == "center"
+        and pos.y < 0 and pos.x == 0 and pos.z == 0 then
+        state.status = "recovery_required"
+        state.error = "Worker rebooted at a persisted layer-centre anchor. Use Recover checkpoint."
+    else
+        state.positionConfidence = "unknown"
+        state.recoveryAnchor = nil
+        state.status = "recovery_required"
+        state.error = "Worker rebooted during movement. Return it to a dock manually, then Detect docks."
+    end
+end
 
 -- A successful updater reboots after marking the device as updating. On the
 -- next boot, restore the normal docked state before reporting to the controller.
@@ -136,6 +167,13 @@ local STATUS_LABELS = {
     update_pending = "Update queued",
     updating = "Installing update",
     update_failed = "Update failed",
+    preflight = "Running preflight checks",
+    relocation_ready = "Ready to relocate",
+    recovery_required = "Recovery required",
+    position_unknown = "Position unknown - do not move",
+    tool_missing = "Mining tool missing",
+    modem_missing = "Wireless modem missing",
+    incompatible = "Incompatible controller protocol",
 }
 
 local function trimLine(value, width)
@@ -185,6 +223,7 @@ local function renderWorkerScreen(force)
 
     local controllerText = controller and ("#" .. tostring(controller)) or "searching"
     writeLine("Controller: " .. controllerText .. " | Modem: " .. modemSide)
+    writeLine("Protocol: " .. PROTOCOL_VERSION .. " | Position: " .. tostring(state.positionConfidence))
     if state.pendingUpdate then
         writeLine("Update queued: v" .. tostring(state.pendingUpdate.version), colors.cyan)
     end
@@ -238,6 +277,7 @@ end
 
 local function persist(force)
     state.version = VERSION
+    state.protocolVersion = PROTOCOL_VERSION
     state.controller = controller
     state.dock = dock
     state.pos = pos
@@ -268,6 +308,8 @@ local function send(kind, data)
     data = data or {}
     data.type = kind
     data.version = VERSION
+    data.protocolVersion = PROTOCOL_VERSION
+    data.positionConfidence = state.positionConfidence
     if data.dock == nil then data.dock = dock end
     return rednet.send(controller, data, PROTOCOL)
 end
@@ -304,6 +346,7 @@ end
 local function cleanUpdateTemps()
     local paths = {
         "/roomba/worker.lua.update",
+        "/roomba/boot.lua.update",
         "/startup.lua.update",
         "/roomba.lua.update",
     }
@@ -340,6 +383,7 @@ local function applyPendingUpdate()
 
     local files = {
         { remote = "roomba_worker.lua", localPath = "/roomba/worker.lua" },
+        { remote = "roomba_boot.lua", localPath = "/roomba/boot.lua" },
         { remote = "startup_worker.lua", localPath = "/startup.lua" },
         { remote = "roomba.lua", localPath = "/roomba.lua" },
     }
@@ -401,6 +445,16 @@ local function applyPendingUpdate()
         handle.close()
     end
 
+    local manifestFiles = {}
+    for _, entry in ipairs(files) do manifestFiles[#manifestFiles + 1] = entry.localPath end
+    saveTable(fs.combine(ROOT, "update_manifest.db"), {
+        role = "worker",
+        targetVersion = request.version,
+        files = manifestFiles,
+        attempts = 0,
+        installedAt = os.epoch("utc"),
+    })
+
     local committed = {}
     local ok, commitError = pcall(function()
         for _, entry in ipairs(files) do
@@ -421,6 +475,8 @@ local function applyPendingUpdate()
             end
         end
         cleanUpdateTemps()
+        local manifest = fs.combine(ROOT, "update_manifest.db")
+        if fs.exists(manifest) then fs.delete(manifest) end
         state.status = "update_failed"
         state.error = "Could not install update: " .. tostring(commitError)
         uiMessage = state.error
@@ -622,6 +678,14 @@ local function turnTo(direction)
     end
 end
 
+local function markMovementUnsafe()
+    if state.positionConfidence ~= "unknown" or state.recoveryAnchor ~= nil then
+        state.positionConfidence = "unknown"
+        state.recoveryAnchor = nil
+        persist(true)
+    end
+end
+
 local function advancePosition()
     local direction = vec[pos.dir]
     pos.x = pos.x + direction.x
@@ -632,6 +696,16 @@ end
 local function isComputerCraftBlock(data)
     local name = data and data.name or ""
     return name:find("computercraft") ~= nil
+end
+
+local function isLavaBlock(data)
+    local name = tostring(data and data.name or ""):lower()
+    return name:find("lava", 1, true) ~= nil
+end
+
+local function isWaterBlock(data)
+    local name = tostring(data and data.name or ""):lower()
+    return name:find("water", 1, true) ~= nil
 end
 
 local function protectedBlock(data)
@@ -686,45 +760,56 @@ end
 
 local function forwardOpen()
     ensureFuel(1)
-    if turtle.forward() then advancePosition(); return true end
+    markMovementUnsafe()
     local occupied, data = turtle.inspect()
+    if occupied and isLavaBlock(data) then
+        reportError("Lava detected in a known-open route. Worker stopped before entering it.", { block = data.name })
+    end
     if occupied and isComputerCraftBlock(data) then
         waitForComputerCraftObstruction(turtle.inspect, "in front", state.status)
         return forwardOpen()
     end
-    if occupied then return false, "blocked by " .. tostring(data and data.name) end
+    if occupied and not isWaterBlock(data) then
+        return false, "blocked by " .. tostring(data and data.name)
+    end
+    if turtle.forward() then advancePosition(); return true end
     return entityBlockedForward()
 end
 
 local function forwardMine()
     ensureFuel(1)
+    markMovementUnsafe()
     local direction = vec[pos.dir]
     local nextX, nextZ = pos.x + direction.x, pos.z + direction.z
     if not interior[key(nextX, nextZ)] then return false, "map boundary", false end
 
-    if turtle.forward() then
-        advancePosition()
-        carved[key(pos.x, pos.z)] = true
-        return true, nil, false
-    end
-
     for _ = 1, MAX_FALLING_DIGS do
         local occupied, data = turtle.inspect()
-        if occupied then
-            if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("front", "inventory")) then
-                reportError("Protected block or inventory in mining route: " .. tostring(data and data.name))
-            end
-            if not selectCollectionSlot() then return false, "storage full", false end
-            local dug, reason = turtle.dig()
-            if not dug then reportError("Unable to dig block: " .. tostring(reason), { block = data and data.name }) end
+        if occupied and isLavaBlock(data) then
+            reportError("Lava detected in the mining route. Worker stopped before entering it.", { block = data.name })
+        end
+
+        if not occupied or isWaterBlock(data) then
             if turtle.forward() then
                 advancePosition()
                 carved[key(pos.x, pos.z)] = true
-                return true, nil, true
+                return true, nil, false
             end
-        else
             local moved, reason = entityBlockedForward()
+            if moved then carved[key(pos.x, pos.z)] = true end
             return moved, reason or "entity obstruction", false
+        end
+
+        if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("front", "inventory")) then
+            reportError("Protected block or inventory in mining route: " .. tostring(data and data.name))
+        end
+        if not selectCollectionSlot() then return false, "storage full", false end
+        local dug, reason = turtle.dig()
+        if not dug then reportError("Unable to dig block: " .. tostring(reason), { block = data and data.name }) end
+        if turtle.forward() then
+            advancePosition()
+            carved[key(pos.x, pos.z)] = true
+            return true, nil, true
         end
         sleep(MOVE_RETRY_DELAY)
     end
@@ -733,13 +818,19 @@ end
 
 local function upOpen()
     ensureFuel(1)
-    if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
+    markMovementUnsafe()
     local occupied, data = turtle.inspectUp()
+    if occupied and isLavaBlock(data) then
+        reportError("Lava detected above the worker. Worker stopped before entering it.", { block = data.name })
+    end
     if occupied and isComputerCraftBlock(data) then
         waitForComputerCraftObstruction(turtle.inspectUp, "above", state.status)
         return upOpen()
     end
-    if occupied then reportError("Vertical shaft blocked above by " .. tostring(data and data.name)) end
+    if occupied and not isWaterBlock(data) then
+        reportError("Vertical shaft blocked above by " .. tostring(data and data.name))
+    end
+    if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
     sleep(5)
     if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
     turtle.attackUp()
@@ -750,13 +841,19 @@ end
 
 local function downOpen()
     ensureFuel(1)
-    if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
+    markMovementUnsafe()
     local occupied, data = turtle.inspectDown()
+    if occupied and isLavaBlock(data) then
+        reportError("Lava detected below the worker. Worker stopped before entering it.", { block = data.name })
+    end
     if occupied and isComputerCraftBlock(data) then
         waitForComputerCraftObstruction(turtle.inspectDown, "below", state.status)
         return downOpen()
     end
-    if occupied then reportError("Expected-open route blocked below by " .. tostring(data and data.name)) end
+    if occupied and not isWaterBlock(data) then
+        reportError("Expected-open route blocked below by " .. tostring(data and data.name))
+    end
+    if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     sleep(5)
     if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
     turtle.attackDown()
@@ -767,28 +864,34 @@ end
 
 local function downDig()
     ensureFuel(1)
-    if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
+    markMovementUnsafe()
     local occupied, data = turtle.inspectDown()
-    if occupied then
-        if isComputerCraftBlock(data) then
-            waitForComputerCraftObstruction(turtle.inspectDown, "below the shaft", state.status)
-            return downDig()
-        end
-        if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("bottom", "inventory")) then
-            reportError("Protected block below the shaft.")
-        end
-        if not selectCollectionSlot() then reportError("Storage slots 2-16 are occupied before shaft digging.") end
-        local dug, reason = turtle.digDown()
-        if not dug then reportError("Cannot dig shaft downward: " .. tostring(reason)) end
+    if occupied and isLavaBlock(data) then
+        reportError("Lava detected below the mining shaft. Worker stopped before descending.", { block = data.name })
+    end
+    if occupied and isComputerCraftBlock(data) then
+        waitForComputerCraftObstruction(turtle.inspectDown, "below the shaft", state.status)
+        return downDig()
+    end
+
+    if not occupied or isWaterBlock(data) then
         if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
-    else
         sleep(5)
         if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
         turtle.attackDown()
         sleep(MOVE_RETRY_DELAY)
         if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
+        reportError("Cannot descend the shaft after waiting and attacking once.")
     end
-    reportError("Cannot descend the shaft.")
+
+    if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("bottom", "inventory")) then
+        reportError("Protected block below the shaft.")
+    end
+    if not selectCollectionSlot() then reportError("Storage slots 2-16 are occupied before shaft digging.") end
+    local dug, reason = turtle.digDown()
+    if not dug then reportError("Cannot dig shaft downward: " .. tostring(reason)) end
+    if turtle.down() then pos.y = pos.y - 1; markMoved(); return end
+    reportError("Cannot descend the shaft after digging.")
 end
 
 local function findPath(startX, startZ, goalX, goalZ, allowed)
@@ -946,12 +1049,17 @@ local function ascendDock()
     if pos.x ~= info.x or pos.z ~= info.z then reportError("Not at assigned shaft before ascent.") end
     while pos.y < 0 do upOpen() end
     turnTo(info.out)
+    state.recoveryAnchor = "dock"
+    state.positionConfidence = "confirmed"
     persist(true)
 end
 
 local function descendDock(layer)
     local info = dockInfo[dock]
     if pos.x ~= info.x or pos.z ~= info.z or pos.y ~= 0 then reportError("Not at dock before descent.") end
+    state.positionConfidence = "unknown"
+    state.recoveryAnchor = nil
+    persist(true)
     while pos.y > -layer do downDig() end
 end
 
@@ -964,6 +1072,8 @@ local function goCenterForLayer(layer)
     descendDock(layer)
     enterCenterFromDockAtCurrentY()
     turnTo(NORTH)
+    state.recoveryAnchor = "center"
+    persist(true)
 end
 
 local function dumpUp(allowIncomplete)
@@ -1012,11 +1122,16 @@ local function applyTaskMessage(message)
         fuelLockGranted = false
     elseif message.type == "update_request" then
         queueUpdateRequest(message)
+    elseif message.type == "recover_checkpoint" then
+        abortRequested = true
+        parkRequested = true
+        paused = false
     end
 end
 
 local function taskHeartbeat()
     renderWorkerScreen(false)
+    local usedStorageSlots, storedItems = storageSummary()
     send("heartbeat", {
         status = state.status,
         layer = state.layer,
@@ -1024,6 +1139,14 @@ local function taskHeartbeat()
         position = pos,
         progress = state.progress,
         total = state.total,
+        firstLayer = state.firstLayer,
+        lastLayer = state.lastLayer,
+        checkpoint = state.checkpoint,
+        recoveryAnchor = state.recoveryAnchor,
+        fuelItems = turtle.getItemCount(FUEL_SLOT),
+        emptyStorageSlots = countEmptyStorageSlots(),
+        usedStorageSlots = usedStorageSlots,
+        storedItems = storedItems,
     })
     persist(false)
 end
@@ -1071,6 +1194,9 @@ local function returnFromFuelStation(info)
     if not moved then releaseFuelLock(); reportError("Cannot return to dock from fuel route: " .. tostring(reason)) end
     turnTo(info.out)
     releaseFuelLock()
+    state.positionConfidence = "confirmed"
+    state.recoveryAnchor = "dock"
+    persist(true)
 end
 
 local function stopForEmptyFuelStation(info)
@@ -1225,12 +1351,20 @@ local function buildRoute()
 end
 
 local function routeCenter()
-    if pos.x == 0 and pos.z == 0 then return end
+    if pos.x == 0 and pos.z == 0 then
+        state.positionConfidence = "recoverable"
+        state.recoveryAnchor = "center"
+        persist(true)
+        return
+    end
     carved[key(pos.x, pos.z)] = true
     carved[key(0, 0)] = true
     local path, err = findPath(pos.x, pos.z, 0, 0, carved)
     if not path then reportError("No carved return path: " .. tostring(err)) end
     followOpen(path)
+    state.positionConfidence = "recoverable"
+    state.recoveryAnchor = "center"
+    persist(true)
 end
 
 local function reserveForDock(layer)
@@ -1263,6 +1397,7 @@ local function excavateLayer(layer, route, totalMoves)
     state.layer = layer
     state.progress = 0
     state.total = totalMoves
+    state.checkpoint = { layer = layer, progress = 0, status = "mining", position = { x = pos.x, y = pos.y, z = pos.z, dir = pos.dir } }
     setStatus("mining", "Mining layer " .. tostring(layer))
     send("layer_started", { layer = layer })
     carved = { [key(0, 0)] = true }
@@ -1286,8 +1421,15 @@ local function excavateLayer(layer, route, totalMoves)
             movesDone = movesDone + 1
             inventoryChecks = inventoryChecks + 1
             state.progress = movesDone
+            state.checkpoint = {
+                layer = layer,
+                progress = movesDone,
+                status = "mining",
+                position = { x = pos.x, y = pos.y, z = pos.z, dir = pos.dir },
+            }
             if movesDone % 8 == 0 then
                 uiMessage = "Mining layer " .. tostring(layer) .. " - " .. tostring(movesDone) .. "/" .. tostring(totalMoves)
+                persist(true)
                 renderWorkerScreen(false)
             end
 
@@ -1357,6 +1499,10 @@ local function clearJobState()
     state.layer = nil
     state.progress = nil
     state.total = nil
+    state.checkpoint = nil
+    state.assignment = nil
+    state.jobMap = nil
+    state.recoveryAnchor = "dock"
     state.error = nil
 end
 
@@ -1435,7 +1581,17 @@ local function runSectionWork(message)
     state.jobId = message.jobId
     state.firstLayer = message.firstLayer
     state.lastLayer = message.lastLayer
+    state.assignment = {
+        jobId = message.jobId,
+        firstLayer = message.firstLayer,
+        lastLayer = message.lastLayer,
+        dock = message.dock or dock,
+        mapName = message.mapName,
+        testRun = message.testRun == true,
+    }
+    state.jobMap = message.map
     state.error = nil
+    persist(true)
     setStatus("starting", "Building route for layers " .. tostring(message.firstLayer) .. "-" .. tostring(message.lastLayer))
 
     validateFuelSlot()
@@ -1481,8 +1637,8 @@ local function runManagedTask(taskFunction)
         end,
         function()
             while not taskDone do
-                local sender, message, protocol = rednet.receive(PROTOCOL, 1)
-                if sender == controller and protocol == PROTOCOL then applyTaskMessage(message) end
+                local sender, message, protocol = rednet.receive(nil, 1)
+                if sender == controller and (protocol == PROTOCOL or protocol == LEGACY_PROTOCOL) then applyTaskMessage(message) end
                 if not sender then taskHeartbeat() end
             end
         end
@@ -1492,6 +1648,93 @@ local function runManagedTask(taskFunction)
     persist(true)
     applyPendingUpdate()
     return taskOk, taskError
+end
+
+local function safeToolCheck()
+    local occupied = turtle.inspect()
+    if occupied then return "unknown", "front is occupied; tool check skipped" end
+    local ok, reason = turtle.dig()
+    reason = tostring(reason or "")
+    if ok then return true, "tool responded" end
+    if reason:lower():find("no tool", 1, true) then return false, reason end
+    return true, reason ~= "" and reason or "air test passed"
+end
+
+local function buildPreflightReport(requestId)
+    local previousSlot = turtle.getSelectedSlot()
+    local usedStorageSlots, storedItems = storageSummary()
+    turtle.select(FUEL_SLOT)
+    local fuelCount = turtle.getItemCount(FUEL_SLOT)
+    local fuelValid = fuelCount == 0 or turtle.refuel(0)
+    turtle.select(previousSlot)
+    local toolOk, toolMessage = safeToolCheck()
+    local outputAbove = peripheral.hasType and peripheral.hasType("top", "inventory") or false
+    return {
+        requestId = requestId,
+        status = state.status,
+        version = VERSION,
+        protocolVersion = PROTOCOL_VERSION,
+        physicallyDocked = isPhysicallyDocked(),
+        dock = dock,
+        positionConfidence = state.positionConfidence,
+        fuel = fuelLevel(),
+        fuelItems = fuelCount,
+        fuelValid = fuelValid,
+        emptyStorageSlots = countEmptyStorageSlots(),
+        usedStorageSlots = usedStorageSlots,
+        storedItems = storedItems,
+        outputInventoryAbove = outputAbove,
+        modemSide = modemSide,
+        toolOk = toolOk,
+        toolMessage = toolMessage,
+        pendingUpdate = state.pendingUpdate and state.pendingUpdate.version or nil,
+        assignment = state.assignment,
+    }
+end
+
+local function prepareRelocation()
+    if taskActive or not isPhysicallyDocked() then
+        send("relocation_rejected", { message = "Worker must be idle and physically docked." })
+        return
+    end
+    local _, storedItems = storageSummary()
+    if storedItems > 0 then
+        dumpUp(true)
+        _, storedItems = storageSummary()
+        if storedItems > 0 then
+            send("relocation_rejected", { message = "Worker still holds mined items. Clear the output inventory and unload before relocating." })
+            return
+        end
+    end
+    clearJobState()
+    dock = nil
+    state.dock = nil
+    state.positionConfidence = "unknown"
+    state.status = "relocation_ready"
+    state.error = nil
+    controller = controller
+    os.setComputerLabel("Roomba Worker (relocation)")
+    persist(true)
+    renderWorkerScreen(true)
+    send("relocation_ready", {})
+end
+
+local function recoverSavedCheckpoint()
+    if state.positionConfidence ~= "recoverable" then
+        send("recovery_rejected", { message = "Saved position is not safe enough for automatic movement." })
+        return
+    end
+    local ok, err = runManagedTask(function()
+        setStatus("recovering", "Returning from saved shaft/centre anchor")
+        local unloaded = recoverToDockAndUnload()
+        state.positionConfidence = "confirmed"
+        state.status = "parked"
+        state.error = nil
+        state.recoveryAnchor = "dock"
+        persist(true)
+        send("worker_parked", { note = unloaded and "recovered from checkpoint" or "recovered; output chest full", position = pos })
+    end)
+    if not ok then reportError("Checkpoint recovery failed: " .. tostring(err)) end
 end
 
 local function discoverController()
@@ -1504,7 +1747,7 @@ local function discoverController()
             persist(true)
             break
         end
-        rednet.broadcast({ type = "hello", version = VERSION, status = state.status, dock = dock }, PROTOCOL)
+        rednet.broadcast({ type = "hello", version = VERSION, protocolVersion = PROTOCOL_VERSION, status = state.status, dock = dock }, PROTOCOL)
         sleep(2)
     end
     setActivity("Connected to controller #" .. tostring(controller))
@@ -1518,7 +1761,7 @@ local function dockProbeLoop()
             controller = controller or rednet.lookup(PROTOCOL, HOSTNAME)
             if controller then
                 persist(true)
-                rednet.send(controller, { type = "dock_probe", version = VERSION, dock = dock }, PROTOCOL)
+                rednet.send(controller, { type = "dock_probe", version = VERSION, protocolVersion = PROTOCOL_VERSION, dock = dock }, PROTOCOL)
             end
         end
     end
@@ -1542,22 +1785,36 @@ end
 local function commandLoop()
     discoverController()
     while true do
-        local sender, message, protocol = rednet.receive(PROTOCOL, 5)
+        local sender, message, protocol = rednet.receive(nil, 5)
         if not sender then
             applyPendingUpdate()
             renderWorkerScreen(false)
             local found = rednet.lookup(PROTOCOL, HOSTNAME)
             if found then controller = found end
+            local usedStorageSlots, storedItems = storageSummary()
             send("heartbeat", {
                 status = state.status,
                 layer = state.layer,
                 fuel = fuelLevel(),
+                fuelItems = turtle.getItemCount(FUEL_SLOT),
+                emptyStorageSlots = countEmptyStorageSlots(),
+                usedStorageSlots = usedStorageSlots,
+                storedItems = storedItems,
                 position = pos,
                 progress = state.progress,
                 total = state.total,
+                firstLayer = state.firstLayer,
+                lastLayer = state.lastLayer,
+                checkpoint = state.checkpoint,
+                recoveryAnchor = state.recoveryAnchor,
+                assignment = state.assignment,
             })
-        elseif protocol == PROTOCOL and type(message) == "table" then
-            if message.type == "dock_probe_begin" then
+        elseif (protocol == PROTOCOL or protocol == LEGACY_PROTOCOL) and type(message) == "table" then
+            local trusted = sender == controller
+            local pairingMessage = message.type == "dock_probe_begin" or message.type == "dock_assigned" or message.type == "dock_conflict"
+            if not trusted and not pairingMessage then
+                -- Ignore direct commands from pockets or unrelated computers.
+            elseif message.type == "dock_probe_begin" then
                 controller = message.controller or controller
                 persist(true)
 
@@ -1567,6 +1824,8 @@ local function commandLoop()
                 dock = message.dock
                 local info = dockInfo[dock]
                 pos = { x = info.x, y = 0, z = info.z, dir = info.out }
+                state.positionConfidence = "confirmed"
+                state.recoveryAnchor = "dock"
                 clearJobState()
                 setStatus("docked", "Docked, unloaded, and ready")
                 restoreComputerLabel()
@@ -1587,7 +1846,17 @@ local function commandLoop()
 
             elseif message.type == "start_section" then
                 setActivity("Controller assigned a mining section")
-                if not dock then
+                if tonumber(message.protocolVersion or PROTOCOL_VERSION) ~= PROTOCOL_VERSION then
+                    state.status = "incompatible"
+                    state.error = "Controller protocol is incompatible with this worker."
+                    persist(true)
+                    send("worker_error", { message = state.error, position = pos })
+                elseif state.positionConfidence ~= "confirmed" then
+                    state.status = "position_unknown"
+                    state.error = "Position must be confirmed at a dock before starting work."
+                    persist(true)
+                    send("worker_error", { message = state.error, position = pos })
+                elseif not dock then
                     state.status = "error"
                     state.error = "Worker is not dock-assigned."
                     persist(true)
@@ -1654,10 +1923,20 @@ local function commandLoop()
                     end
                 end
 
+            elseif message.type == "preflight_request" then
+                send("preflight_response", buildPreflightReport(message.requestId))
+
+            elseif message.type == "prepare_relocation" then
+                prepareRelocation()
+
+            elseif message.type == "recover_checkpoint" then
+                recoverSavedCheckpoint()
+
             elseif message.type == "update_request" then
                 queueUpdateRequest(message)
 
             elseif message.type == "status_request" then
+                local usedStorageSlots, storedItems = storageSummary()
                 send("heartbeat", {
                     status = state.status,
                     layer = state.layer,
@@ -1665,6 +1944,15 @@ local function commandLoop()
                     position = pos,
                     progress = state.progress,
                     total = state.total,
+                    firstLayer = state.firstLayer,
+                    lastLayer = state.lastLayer,
+                    checkpoint = state.checkpoint,
+                    recoveryAnchor = state.recoveryAnchor,
+                    fuelItems = turtle.getItemCount(FUEL_SLOT),
+                    emptyStorageSlots = countEmptyStorageSlots(),
+                    usedStorageSlots = usedStorageSlots,
+                    storedItems = storedItems,
+                    assignment = state.assignment,
                 })
 
             elseif message.type == "clear_error" then
@@ -1681,8 +1969,17 @@ end
 
 renderWorkerScreen(true)
 
+local function healthLoop()
+    sleep(8)
+    if fs.exists(BOOT_FILE) then
+        local ok, boot = pcall(dofile, BOOT_FILE)
+        if ok and boot and boot.markHealthy then boot.markHealthy("worker", VERSION) end
+    end
+    while true do sleep(3600) end
+end
+
 local ok, err = pcall(function()
-    parallel.waitForAny(dockProbeLoop, commandLoop)
+    parallel.waitForAny(dockProbeLoop, commandLoop, healthLoop)
 end)
 if not ok then
     state.status = "error"

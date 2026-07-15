@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.3.0
+
+### Secure Roomba Pocket
+
+- Added `roomba_pocket.lua` and `startup_pocket.lua` for Advanced Wireless/Ender Pocket Computers.
+- Added secure controller pairing with a 12-character code and 90-second expiry.
+- Added per-pocket HMAC-SHA256 keys, signed requests/responses, and sequence-based replay protection.
+- Added Viewer, Operator, and Administrator roles enforced by the controller.
+- Added local pocket PIN, salted PIN storage, idle locking, and configurable lock timeout.
+- Added remote overview, workers, jobs/maps, test run, preflight, pause/resume, safe abort, logs, history, alerts, backups, relocation, security administration, and safe update.
+- Added configurable alert severities and optional speaker notification when a speaker is present.
+
+### Safety and recovery
+
+- Added mandatory job preflight with version, protocol, dock, output, fuel, storage, tool, update, and position checks.
+- Added one-layer test mode and required a passed test before full jobs at each physical hive site.
+- Added explicit `confirmed`, `recoverable`, and `unknown` position confidence.
+- Added conservative crash recovery from persisted layer-centre checkpoints.
+- Added refusal to move automatically when position confidence is unknown.
+- Added relocation mode which preserves maps/settings while clearing physical dock claims.
+- Added explicit worker states for fuel, output, blockage, recovery, update, tool, modem, and compatibility problems.
+- Safe update and relocation now require workers to be physically docked, position-confirmed, and unloaded.
+
+### Operations and visibility
+
+- Added fuel estimates in movement units and coal equivalents using 80 units per coal item.
+- Fixed low-layer distribution so two layers with four turtles uses the first two docked workers rather than skipping dock order.
+- Added job history and bounded event logs.
+- Added controller backup creation, listing, and safe restore.
+- Added remote backup create/restore for Administrator pockets.
+- Added live stored-item counts to worker status and preflight.
+- Rewrote the GitHub README with complete build, installation, pocket, recovery, relocation, fuel, update, and troubleshooting documentation.
+
+### Updates
+
+- Added separate program and protocol versions.
+- Added v2 worker protocol while retaining legacy update reception for v0.2.3 migration.
+- Added transactional installers for controller, worker, and pocket.
+- Added temporary download files, syntax validation, `.old` backups, boot health manifests, repeated-start retry, and automatic rollback after two failed starts.
+- Safe Pocket Update aborts work, waits for all assigned workers to dock and unload, updates the hive, then updates the pocket last.
+
 ## v0.2.3
 
 - Added controller-triggered over-the-air worker updates.
