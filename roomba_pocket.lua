@@ -1,7 +1,7 @@
--- Roomba Hive Pocket v0.3.0
+-- Roomba Hive Pocket v0.3.1
 -- Secure remote dashboard for an Advanced Wireless/Ender Pocket Computer.
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local PROTOCOL_VERSION = 2
 local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
@@ -63,6 +63,7 @@ local locked = false
 local lastActivity = os.epoch("utc")
 local pairing = nil
 local statusCache = nil
+local statusCacheAt = 0
 
 local function persist()
     state.version = VERSION
@@ -230,6 +231,16 @@ local function remoteRequest(action, params, timeout)
         sleep(0.05)
     end
     return false, nil, "Controller did not respond."
+end
+
+local function refreshStatusCache(timeout)
+    local ok, result = remoteRequest("status", {}, timeout or 4)
+    if ok then
+        statusCache = result
+        statusCacheAt = os.epoch("utc")
+        return true
+    end
+    return false
 end
 
 local function pairController()
@@ -705,22 +716,110 @@ local function unreadAlertCount()
     return count
 end
 
+local function cachedWorkerSummary()
+    local total, online, docked = 0, 0, 0
+    local fuelState = "OK"
+    for _, worker in ipairs(statusCache and statusCache.workers or {}) do
+        total = total + 1
+        local status = tostring(worker.status or "unknown")
+        if not status:find("^offline") then online = online + 1 end
+        if status == "docked" or status == "parked" or status == "aborted" or status == "fuel_station_empty" then
+            docked = docked + 1
+        end
+        if status == "fuel_station_empty" or status == "waiting_for_fuel" then fuelState = "RESTOCK" end
+    end
+    return total, online, docked, fuelState
+end
+
 local function renderHome()
-    clear("ROOMBA HIVE POCKET v" .. VERSION)
+    clear("ROOMBA HIVE")
     local controller = activeController()
     print("Pocket #" .. os.getComputerID() .. " | " .. tostring(controller and controller.role or "unpaired"))
     print("Controller: " .. tostring(controller and ("#" .. controller.id) or "none"))
+
     if statusCache and statusCache.job then
-        print("Job: " .. tostring(statusCache.job.mapName) .. " | " .. tostring(statusCache.job.status))
-        print("Progress: " .. tostring(statusCache.job.completedCount or 0) .. "/" .. tostring(statusCache.job.layers))
-    else print("Job status: open Overview to refresh") end
-    print("Unread alerts: " .. unreadAlertCount())
+        print("Job: " .. tostring(statusCache.job.status) .. " " .. tostring(statusCache.job.completedCount or 0) .. "/" .. tostring(statusCache.job.layers))
+    elseif statusCache then
+        print("Job: idle")
+    else
+        print("Job: connecting...")
+    end
+
+    local total, online, docked, fuelState = cachedWorkerSummary()
+    print("Workers: " .. online .. "/" .. total .. " online")
+    print("Docked: " .. docked .. " | Fuel: " .. fuelState)
+    print("Alerts: " .. unreadAlertCount())
     print("")
-    print("1 Overview       2 Workers")
-    print("3 Jobs/Maps      4 Pause/Resume")
-    print("5 Safe Abort     6 Safe Update")
-    print("7 Alerts/Logs    8 Admin Tools")
-    print("9 Security       0 Exit")
+    print("1  Quick Actions")
+    print("2  Workers")
+    print("3  Jobs & Maps")
+    print("4  Alerts & Logs")
+    print("5  System")
+    print("0  Lock Pocket")
+end
+
+local function quickActionsMenu()
+    while true do
+        refreshStatusCache(4)
+        clear("QUICK ACTIONS")
+        local controller = activeController()
+        local role = controller and controller.role or "viewer"
+        local jobStatus = statusCache and statusCache.job and statusCache.job.status or nil
+        local options = {}
+
+        local function add(label, action)
+            options[#options + 1] = { label = label, action = action }
+        end
+
+        add("View live overview", "overview")
+        if roleRank(role) >= 2 and jobStatus == "running" then add("Pause hive", "pause") end
+        if roleRank(role) >= 2 and jobStatus == "paused" then add("Resume hive", "resume") end
+        if roleRank(role) >= 2 and (jobStatus == "running" or jobStatus == "paused" or jobStatus == "aborting") then
+            add("Safe abort", "abort")
+        end
+        if roleRank(role) >= 3 then add("Safe update hive", "update") end
+
+        for index, option in ipairs(options) do print(index .. "  " .. option.label) end
+        print("0  Back")
+        local choice = tonumber(prompt("Choose: "))
+        if not choice or choice == 0 then return end
+        local selected = options[choice]
+        if selected then
+            if selected.action == "overview" then showOverview()
+            elseif selected.action == "pause" then
+                local ok, _, err = remoteRequest("pause_hive")
+                print(ok and "Pause requested." or tostring(err)); sleep(2)
+            elseif selected.action == "resume" then
+                local ok, _, err = remoteRequest("resume_hive")
+                print(ok and "Resume requested." or tostring(err)); sleep(2)
+            elseif selected.action == "abort" then safeAbort()
+            elseif selected.action == "update" then safeUpdate() end
+        end
+    end
+end
+
+local function systemMenu()
+    while true do
+        local controller = activeController()
+        clear("SYSTEM")
+        local options = {}
+        local function add(label, action)
+            options[#options + 1] = { label = label, action = action }
+        end
+        if controller and roleRank(controller.role) >= 3 then add("Administrator tools", "admin") end
+        add("Pocket security", "security")
+        add("Exit program", "exit")
+        for index, option in ipairs(options) do print(index .. "  " .. option.label) end
+        print("0  Back")
+        local choice = tonumber(prompt("Choose: "))
+        if not choice or choice == 0 then return end
+        local selected = options[choice]
+        if selected then
+            if selected.action == "admin" then adminMenu()
+            elseif selected.action == "security" then securityMenu()
+            elseif selected.action == "exit" then running = false; return end
+        end
+    end
 end
 
 local function uiLoop()
@@ -730,23 +829,20 @@ local function uiLoop()
         elseif not ensureConnection() then
             running = false
         else
+            if not statusCache or os.epoch("utc") - statusCacheAt >= 5000 then refreshStatusCache(4) end
             renderHome()
-            local _, character = os.pullEvent("char")
-            if locked then
-                -- The idle timer fired while waiting for input. Discard this key
-                -- and require the PIN before processing another command.
-            else
+            local refreshTimer = os.startTimer(5)
+            local event, value = os.pullEvent()
+            if event == "char" and not locked then
                 touchActivity()
-                if character == "1" then showOverview()
-                elseif character == "2" then workerMenu()
-                elseif character == "3" then jobsMenu()
-                elseif character == "4" then pauseResumeMenu()
-                elseif character == "5" then safeAbort()
-                elseif character == "6" then safeUpdate()
-                elseif character == "7" then alertsMenu()
-                elseif character == "8" then adminMenu()
-                elseif character == "9" then securityMenu()
-                elseif character == "0" then running = false end
+                if value == "1" then quickActionsMenu()
+                elseif value == "2" then workerMenu()
+                elseif value == "3" then jobsMenu()
+                elseif value == "4" then alertsMenu()
+                elseif value == "5" then systemMenu()
+                elseif value == "0" then locked = true end
+            elseif event == "timer" and value == refreshTimer then
+                refreshStatusCache(4)
             end
         end
     end

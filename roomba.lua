@@ -1,6 +1,6 @@
--- Roomba Hive command utility v0.3.0
+-- Roomba Hive command utility v0.3.1
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local PROTOCOL_VERSION = 2
 local INSTALL_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua"
 local args = { ... }

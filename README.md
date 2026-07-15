@@ -1,10 +1,19 @@
-# Roomba Hive v0.3.0
+# Roomba Hive v0.3.1
 
 Roomba Hive is a coordinated quarry system for **CC:Tweaked**. One Advanced Computer manages up to four mining turtles, while an optional Advanced Wireless or Ender Pocket Computer provides a secure remote dashboard.
 
 The project is designed around safe recovery rather than blind movement. Workers report their state, preserve fuel, queue updates until they are docked, and refuse automatic movement when their saved position is not trustworthy.
 
-## What v0.3.0 adds
+## What v0.3.1 changes
+
+- Simplified the controller dashboard into six grouped categories.
+- Replaced the pocket's crowded two-column menu with a readable one-column dashboard.
+- Added context-aware Pocket Quick Actions.
+- Added automatic pocket status refresh every five seconds while the home screen is open.
+- Corrected player-facing left/right dock labels when looking at the controller screen.
+- Preserved the internal dock coordinates, saved maps, pairings, checkpoints, and job state.
+
+## Core v0.3 features
 
 - Secure Roomba Pocket application with pairing, signed commands, replay protection, permissions, local PIN locking, alerts, and remote administration.
 - Safe remote update workflow for the workers, controller, and pocket.
@@ -84,16 +93,18 @@ The Advanced Computer is logical coordinate `0,0,0`.
 0,0,0  Advanced Computer
 ```
 
-The software internally calls the controller's four physical sides:
+CC:Tweaked names block sides from the computer block's own facing perspective. When you stand in front of the controller screen, the computer's technical `right` side is visually on your left, and its technical `left` side is visually on your right.
+
+Roomba Hive therefore displays the sides as the player sees them:
 
 ```text
-front
-right
-back
-left
+Technical front  -> Front / screen side
+Technical right  -> Left side on screen
+Technical back   -> Back / rear
+Technical left   -> Right side on screen
 ```
 
-Older releases called these north, east, south, and west internally. v0.3.0 keeps the internal map compatibility but displays the physical side names to avoid assuming the controller faces Minecraft north.
+The internal north/east/south/west dock identifiers remain unchanged for saved-map and movement compatibility. Only labels, menus, logs, and pocket displays use the corrected player-facing names.
 
 ## Top view at controller level, Y=0
 
@@ -224,7 +235,7 @@ Uploading a file with the same exact name and path replaces the current reposito
 ## Clean controller installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=030 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 controller
 ```
 
 ## Clean worker installation
@@ -232,29 +243,29 @@ wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install
 Run this on every turtle:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=030 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 worker
 ```
 
 ## Pocket installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=030 pocket
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 pocket
 ```
 
-## Updating from v0.2.3
+## Updating from v0.3.0 or later
 
-v0.2.3 workers already understand controller-triggered updates. The safest migration is:
+The safest migration is:
 
 1. Finish or safely abort the current quarry job.
 2. Confirm all workers are physically docked.
-3. Upload every v0.3.0 file to GitHub.
-4. On the controller, use `U` and complete the update confirmation, or stop the controller UI and run:
+3. Upload every v0.3.1 file to GitHub.
+4. From the existing controller choose `Operations > Safe update hive`, or use `Quick Actions > Safe update hive` on an Administrator pocket. You may also stop the controller UI and run:
 
 ```text
 roomba update
 ```
 
-The installer broadcasts the update request over both the legacy and v0.3 worker protocols before replacing the controller files. Each reachable v0.2.3 worker downloads v0.3.0, validates it, installs it, and reboots.
+The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.1, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
 
 A worker that is offline or whose program has fully stopped cannot receive the request. Use the manual worker command above for that turtle.
 
@@ -267,7 +278,7 @@ roomba reset
 Remote installer form:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=030 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=031 reset
 ```
 
 Factory reset deletes programs, maps, jobs, backups, pairings, labels, and device state. It is **not** required for normal updates, relocation, or moving the quarry downward.
@@ -335,31 +346,54 @@ Choose the map and number of layers. The controller performs preflight, displays
 
 ---
 
-# 6. Controller controls
+# 6. Controller interface
+
+The v0.3.1 home screen is intentionally small and groups related actions:
 
 ```text
-D  Detect physically docked workers
-C  Calibrate a new map
-J  Start a quarry job
-T  Run a one-layer test
-P  Pause the entire hive
-R  Resume the entire hive
-A  Safely abort the entire job
-W  View and manage workers
-M  View saved maps
-L  Prepare relocation mode
-S  Manage pocket security and pairing
-B  Create or restore controller backups
-H  View job history
-G  View event logs
-I  Import a legacy map
-U  Safely update workers and controller
-Q  Close the controller UI
+1  Operations
+2  Workers
+3  Jobs & Maps
+4  Maintenance
+5  Remote & Security
+6  Logs & History
+0  Exit
 ```
 
-Closing the UI does not erase state, but the controller program must be running for normal remote management and worker coordination.
+## Operations
 
----
+- Pause the active hive.
+- Resume a paused hive.
+- Safely abort active work.
+- Safely update workers and the controller.
+
+## Workers
+
+Select a worker to inspect its status, fuel, storage, version, position confidence, and recovery choices.
+
+## Jobs & Maps
+
+- Start a quarry job.
+- Run the required one-layer test.
+- Calibrate a new map.
+- View saved maps.
+- Import a legacy map.
+
+## Maintenance
+
+- Detect physical docks.
+- Prepare and complete relocation.
+- Create or restore controller backups.
+
+## Remote & Security
+
+Pair, rename, re-role, or revoke pocket computers and enable or disable remote access.
+
+## Logs & History
+
+View recent controller events and completed/aborted job history.
+
+The old letter shortcuts are still accepted for experienced users, but they are no longer crowded onto the dashboard.
 
 # 7. Preflight system
 
@@ -688,18 +722,18 @@ The pairing code is used to derive a shared secret; the final secret is not broa
 
 ## Pocket home menu
 
+The portrait display uses one vertical menu:
+
 ```text
-1  Overview
+1  Quick Actions
 2  Workers
-3  Jobs and maps
-4  Pause or resume
-5  Safe abort
-6  Safe update
-7  Alerts and logs
-8  Administrator tools
-9  Security and PIN
-0  Exit
+3  Jobs & Maps
+4  Alerts & Logs
+5  System
+0  Lock Pocket
 ```
+
+The home dashboard refreshes controller status automatically every five seconds. Quick Actions changes with the current job and permission role: it shows Pause while mining, Resume while paused, Safe Abort during active work, and Safe Update for Administrator pockets.
 
 ## Pocket worker controls
 
@@ -887,7 +921,7 @@ Do not force an underground movement command. Manually recover the turtle to its
 Before using valuable terrain:
 
 1. Build the controller with one worker and small output chest.
-2. Install v0.3.0 on controller and worker.
+2. Install v0.3.1 on controller and worker.
 3. Detect the dock.
 4. Calibrate a small disposable closed outline.
 5. Run preflight and confirm the 80-units-per-coal estimate appears.

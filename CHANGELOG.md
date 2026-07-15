@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.1
+
+- Replaced the crowded controller shortcut wall with six grouped menu categories.
+- Replaced the pocket's two-column home screen with a readable one-column dashboard.
+- Added context-aware Pocket Quick Actions and five-second home-screen status refresh.
+- Corrected left/right user-facing labels to match what a player sees while facing the controller screen.
+- Preserved internal dock coordinates and existing maps; no reset, relocation, or recalibration is required.
+- Kept legacy controller letter shortcuts available without displaying them on the home screen.
+
 ## v0.3.0
 
 ### Secure Roomba Pocket

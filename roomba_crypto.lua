@@ -1,4 +1,4 @@
--- Roomba Hive cryptographic helpers v0.3.0
+-- Roomba Hive cryptographic helpers v0.3.1
 -- Pure Lua SHA-256/HMAC-SHA256 for CC:Tweaked's Lua 5.2 environment.
 
 local crypto = {}

@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.3.0
+-- Roomba Hive Controller v0.3.1
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -18,7 +18,7 @@ local CRYPTO_FILE = fs.combine(ROOT, "crypto.lua")
 local DOCK_SIDES = { "front", "right", "back", "left" }
 local SIDE_TO_DOCK = { front = "north", right = "east", back = "south", left = "west" }
 local DOCK_ORDER = { "north", "east", "south", "west" }
-local DOCK_DISPLAY = { north = "front", east = "right", south = "back", west = "left" }
+local DOCK_DISPLAY = { north = "front", east = "left", south = "back", west = "right" }
 local PULSE_SECONDS = 0.75
 local HEARTBEAT_TIMEOUT = 30
 local ABORT_RETRY_SECONDS = 5
@@ -332,50 +332,68 @@ local function isActiveJob()
     )
 end
 
-local function render()
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("ROOMBA HIVE CONTROLLER v" .. VERSION)
-    print("================================")
-    print("Modem: " .. modemSide .. " | Protocol: " .. PROTOCOL_VERSION)
-    local pairedCount = 0
-    for _ in pairs(state.security.paired or {}) do pairedCount = pairedCount + 1 end
-    print("Remote: " .. (state.security.enabled and "enabled" or "disabled") .. " | Pockets: " .. pairedCount)
-    if state.relocationMode then print("RELOCATION MODE: move hive, then Detect docks") end
-    print("")
+local function controllerSummary()
+    local online, docked, issues = 0, 0, 0
+    local fuelState = "OK"
+    local attention = nil
 
-    for _, dock in ipairs(DOCK_ORDER) do
-        local occupied = state.dockOccupancy[dock]
-        local assigned = state.docks[dock]
-        local id = occupied or assigned
-        local worker = id and state.workers[tostring(id)] or nil
-        if occupied and worker then
-            local age = worker.lastSeen and math.floor((os.epoch("utc") - worker.lastSeen) / 1000) or 9999
-            print(string.format("%-5s #%-4s %-14s %ss", displayDock(dock), id, worker.status or "unknown", age))
-        elseif assigned then
-            local status = worker and worker.status or "assigned"
-            print(string.format("%-5s #%-4s %-14s away", displayDock(dock), assigned, status))
-        else
-            print(string.format("%-5s empty", displayDock(dock)))
+    for _, worker in pairs(state.workers) do
+        if workerIsActive(worker.id) then online = online + 1 end
+        if workerIsActive(worker.id) and isDockedStatus(worker.status) then docked = docked + 1 end
+
+        local status = tostring(worker.status or "unknown")
+        if status == "fuel_station_empty" or status == "waiting_for_fuel" then
+            fuelState = "RESTOCK"
+            attention = attention or (workerLabel(worker) .. " needs fuel")
+        elseif status == "output_full" then
+            issues = issues + 1
+            attention = attention or (workerLabel(worker) .. " output is full")
+        elseif status:find("^offline") then
+            issues = issues + 1
+            attention = attention or (workerLabel(worker) .. " is offline")
+        elseif status == "error" or status == "position_unknown" or status == "recovery_required" or status == "incompatible" then
+            issues = issues + 1
+            attention = attention or (workerLabel(worker) .. " needs attention")
         end
     end
 
-    print("")
+    return online, docked, issues, fuelState, attention
+end
+
+local function render()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("ROOMBA HIVE v" .. VERSION)
+    print("==============================")
+
     if state.job then
-        local job = state.job
-        print("Job: " .. tostring(job.mapName) .. " | " .. tostring(job.layers) .. " layers")
-        print("Status: " .. tostring(job.status) .. " | " .. tostring(job.completedCount or 0) .. "/" .. tostring(job.layers))
+        print("Job: " .. tostring(state.job.mapName))
+        print("Status: " .. tostring(state.job.status) .. " | " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.layers))
     else
-        print("No job recorded.")
+        print("Job: none")
+        print("Status: idle")
+    end
+
+    local online, docked, issues, fuelState, attention = controllerSummary()
+    print("Workers: " .. tostring(online) .. " online | " .. tostring(docked) .. " docked")
+    print("Fuel: " .. fuelState .. " | Issues: " .. tostring(issues))
+
+    if state.relocationMode then
+        print("ATTENTION: relocation mode active")
+    elseif attention then
+        print("ATTENTION: " .. attention)
+    else
+        print("Hive ready for commands")
     end
 
     print("")
-    print("[D] Detect  [C] Calibrate  [J] Start")
-    print("[T] Test    [P] Pause      [R] Resume")
-    print("[A] Abort   [W] Workers    [M] Maps")
-    print("[L] Relocate [S] Security  [B] Backups")
-    print("[H] History [G] Logs       [I] Import")
-    print("[U] Safe Update            [Q] Quit UI")
+    print("1  Operations")
+    print("2  Workers")
+    print("3  Jobs & Maps")
+    print("4  Maintenance")
+    print("5  Remote & Security")
+    print("6  Logs & History")
+    print("0  Exit")
 end
 
 local function detectDocks()
@@ -1776,6 +1794,89 @@ local function updateHive()
     end
 end
 
+local function waitForMenuChoice()
+    local _, character = os.pullEvent("char")
+    return tostring(character):lower()
+end
+
+local function menuHeader(title)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print(title)
+    print(string.rep("=", math.min(#title, select(1, term.getSize()))))
+end
+
+local function operationsMenu()
+    while true do
+        menuHeader("OPERATIONS")
+        if state.job then
+            print("Job: " .. tostring(state.job.mapName) .. " | " .. tostring(state.job.status))
+            print("Progress: " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.layers))
+        else
+            print("No active or recorded job.")
+        end
+        print("")
+        print("1  Pause hive")
+        print("2  Resume hive")
+        print("3  Safe abort")
+        print("4  Safe update hive")
+        print("0  Back")
+        local choice = waitForMenuChoice()
+        if choice == "0" then return
+        elseif choice == "1" then pauseJob()
+        elseif choice == "2" then resumeJob()
+        elseif choice == "3" then abortJob()
+        elseif choice == "4" then updateHive() end
+    end
+end
+
+local function jobsAndMapsMenu()
+    while true do
+        menuHeader("JOBS & MAPS")
+        print("1  Start quarry job")
+        print("2  One-layer test")
+        print("3  Calibrate new map")
+        print("4  View saved maps")
+        print("5  Import legacy map")
+        print("0  Back")
+        local choice = waitForMenuChoice()
+        if choice == "0" then return
+        elseif choice == "1" then startJob()
+        elseif choice == "2" then testRun()
+        elseif choice == "3" then calibrate()
+        elseif choice == "4" then mapsView()
+        elseif choice == "5" then importLegacyMap() end
+    end
+end
+
+local function maintenanceMenu()
+    while true do
+        menuHeader("MAINTENANCE")
+        print("1  Detect docks")
+        print("2  Relocate hive")
+        print("3  Backups")
+        print("0  Back")
+        local choice = waitForMenuChoice()
+        if choice == "0" then return
+        elseif choice == "1" then detectDocks()
+        elseif choice == "2" then relocationMenu()
+        elseif choice == "3" then backupsMenu() end
+    end
+end
+
+local function logsAndHistoryMenu()
+    while true do
+        menuHeader("LOGS & HISTORY")
+        print("1  Event logs")
+        print("2  Job history")
+        print("0  Back")
+        local choice = waitForMenuChoice()
+        if choice == "0" then return
+        elseif choice == "1" then logsView()
+        elseif choice == "2" then historyView() end
+    end
+end
+
 local function remoteWorkerSummary(worker)
     return {
         id = worker.id,
@@ -2113,7 +2214,15 @@ local function uiLoop()
         render()
         local _, character = os.pullEvent("char")
         character = character:lower()
-        if character == "d" then detectDocks()
+        if character == "1" then operationsMenu()
+        elseif character == "2" then workersView()
+        elseif character == "3" then jobsAndMapsMenu()
+        elseif character == "4" then maintenanceMenu()
+        elseif character == "5" then securityMenu()
+        elseif character == "6" then logsAndHistoryMenu()
+        elseif character == "0" then running = false
+        -- Legacy shortcuts remain accepted for experienced users.
+        elseif character == "d" then detectDocks()
         elseif character == "c" then calibrate()
         elseif character == "i" then importLegacyMap()
         elseif character == "j" then startJob()
@@ -2129,8 +2238,7 @@ local function uiLoop()
         elseif character == "h" then historyView()
         elseif character == "g" then logsView()
         elseif character == "u" then updateHive()
-        elseif character == "q" then running = false
-        end
+        elseif character == "q" then running = false end
     end
 end
 

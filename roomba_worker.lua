@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.3.0
+-- Roomba Hive Worker v0.3.1
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -39,7 +39,7 @@ local dockInfo = {
     south = { x = 0, z = 1, out = SOUTH, inward = NORTH },
     west = { x = -1, z = 0, out = WEST, inward = EAST },
 }
-local dockDisplay = { north = "front", east = "right", south = "back", west = "left" }
+local dockDisplay = { north = "front", east = "left", south = "back", west = "right" }
 local neighbors = {
     { dx = 0, dz = -1, dir = NORTH },
     { dx = 1, dz = 0, dir = EAST },
