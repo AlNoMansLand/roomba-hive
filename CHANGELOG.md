@@ -1,6 +1,18 @@
 # Changelog
 
-## v0.3.4
+## v0.3.5
+
+- Added resumable unfinished-job planning from the saved layer ledger.
+- Added start-from-layer, skip-layer, exact-layer, and mine-all planning modes.
+- Added comma-separated, range, and mixed layer-list parsing.
+- Added validation for empty entries, reversed ranges, non-numeric entries, out-of-range layers, and all-skipped plans.
+- Added arbitrary non-contiguous layer assignments to workers.
+- Added exact-selection matching between preflight and job start.
+- Updated fuel estimates for selected layer count and actual layer depths.
+- Preserved skipped layers during abort and stored scheduled, started, and completed layer data in job history.
+- No protocol-version bump or reset is required; v0.3.4 saved contiguous jobs remain compatible.
+
+## v0.3.5
 
 - Added emergency straight-up recovery to logical Y=-1 for all connected workers or one selected worker.
 - Added safe mining through ordinary blocks during emergency ascent.
@@ -13,7 +25,7 @@
 - Fixed Safe Update remaining at `committing` after a successful version-changing reboot.
 - No protocol or saved-data migration is required.
 
-## v0.3.4
+## v0.3.5
 
 - Fixed `Cannot serialize table with repeated entries` after Minecraft closes during an active quarry.
 - Controller saves now duplicate shared table references before calling `textutils.serialize`.
@@ -21,7 +33,7 @@
 - Incoming worker position, checkpoint, assignment, and error payloads are copied before being retained.
 - Existing maps, jobs, checkpoints, pairings, and worker assignments remain compatible.
 
-## v0.3.4
+## v0.3.5
 
 - Changed the one-layer test from a startup requirement to an optional safety check.
 - Untested maps now show `UNTESTED (OPTIONAL)` on the controller and `UNTESTED` on the pocket.
@@ -30,7 +42,7 @@
 - Successful tests continue to be recorded for the current hive location.
 - No protocol or data migration is required.
 
-## v0.3.4
+## v0.3.5
 
 - Replaced the crowded controller shortcut wall with six grouped menu categories.
 - Replaced the pocket's two-column home screen with a readable one-column dashboard.

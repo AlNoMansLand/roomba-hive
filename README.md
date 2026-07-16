@@ -1,10 +1,23 @@
-# Roomba Hive v0.3.4
+# Roomba Hive v0.3.5
 
 Roomba Hive is a coordinated quarry system for **CC:Tweaked**. One Advanced Computer manages up to four mining turtles, while an optional Advanced Wireless or Ender Pocket Computer provides a secure remote dashboard.
 
 The project is designed around safe recovery rather than blind movement. Workers report their state, preserve fuel, queue updates until they are docked, and refuse automatic movement when their saved position is not trustworthy.
 
-## What v0.3.4 changes
+## What v0.3.5 changes
+
+- Added a Start a Job submenu with five planning modes: continue unfinished work, start from a chosen layer, skip selected layers, mine exact selected layers, or mine every layer.
+- Layer input accepts separate values (`1,2,3,6,8`), ranges (`1-3,6,8`), mixed input (`1,2,5-8,11`), and harmless spaces.
+- Invalid, reversed, out-of-range, empty, and all-skipped selections are rejected with an explanation.
+- Aborted jobs preserve their scheduled-layer ledger, completed layers, and started-layer history.
+- Continue unfinished job automatically reschedules every incomplete or partially attempted layer while leaving completed layers skipped.
+- Workers now accept non-contiguous layer lists and mine only the assigned layers.
+- Fuel estimates use only scheduled layers and their actual depths.
+- Controller and pocket preflight records are tied to the exact selected layer list, preventing a different plan from starting under an old preflight.
+- Existing v0.3.4 jobs remain readable; old contiguous jobs are treated as all layers from 1 through their saved depth.
+
+
+## What v0.3.5 changes
 
 - Reformatted controller and pocket menus so each numbered action has its own row.
 - Long action names wrap underneath their own number with indentation instead of running into the next option.
@@ -18,7 +31,7 @@ The project is designed around safe recovery rather than blind movement. Workers
 - No map, pairing, dock, or protocol reset is required.
 
 
-## What v0.3.4 changes
+## What v0.3.5 changes
 
 - Repairs controller state saving after Minecraft is closed during an active quarry.
 - Recovery, Abort, worker commands, and heartbeat processing no longer fail when runtime tables share references.
@@ -246,7 +259,7 @@ Uploading a file with the same exact name and path replaces the current reposito
 ## Clean controller installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 controller
 ```
 
 ## Clean worker installation
@@ -254,13 +267,13 @@ wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install
 Run this on every turtle:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 worker
 ```
 
 ## Pocket installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 pocket
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 pocket
 ```
 
 ## Updating from v0.3.0 or later
@@ -269,14 +282,14 @@ The safest migration is:
 
 1. Finish or safely abort the current quarry job.
 2. Confirm all workers are physically docked.
-3. Upload every v0.3.4 file to GitHub.
+3. Upload every v0.3.5 file to GitHub.
 4. From the existing controller choose `Operations > Safe update hive`, or use `Quick Actions > Safe update hive` on an Administrator pocket. You may also stop the controller UI and run:
 
 ```text
 roomba update
 ```
 
-The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.4, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
+The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.5, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
 
 A worker that is offline or whose program has fully stopped cannot receive the request. Use the manual worker command above for that turtle.
 
@@ -289,7 +302,7 @@ roomba reset
 Remote installer form:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 reset
 ```
 
 Factory reset deletes programs, maps, jobs, backups, pairings, labels, and device state. It is **not** required for normal updates, relocation, or moving the quarry downward.
@@ -353,13 +366,13 @@ Press:
 J
 ```
 
-Choose the map and number of layers. The controller performs preflight, displays the estimate, and refuses to start until all blocking problems are fixed.
+Choose whether to continue unfinished work, start from a chosen layer, skip selected layers, mine exact layers, or mine every layer. The controller shows the final scheduled and skipped lists, performs preflight, displays the fuel estimate, and refuses to start until all blocking problems are fixed.
 
 ---
 
 # 6. Controller interface
 
-The v0.3.4 home screen is intentionally small and groups related actions:
+The v0.3.5 home screen is intentionally small and groups related actions:
 
 ```text
 1  Operations
@@ -932,7 +945,7 @@ Do not force an underground movement command. Manually recover the turtle to its
 Before using valuable terrain:
 
 1. Build the controller with one worker and small output chest.
-2. Install v0.3.4 on controller and worker.
+2. Install v0.3.5 on controller and worker.
 3. Detect the dock.
 4. Calibrate a small disposable closed outline.
 5. Run preflight and confirm the 80-units-per-coal estimate appears.
@@ -1004,3 +1017,26 @@ It stops instead of breaking:
 - any route for which its storage or fuel is insufficient.
 
 This mode abandons unfinished work and does not move the turtle horizontally back to its dock. After retrieving the turtles, place them at the controller, run Detect docks, and start a new job or restart unfinished layers as appropriate.
+
+
+## Choosing quarry layers
+
+`Jobs & Maps > Start quarry job` provides:
+
+```text
+1  Continue unfinished job
+2  Start from a chosen layer
+3  Choose layers to skip
+4  Choose exact layers to mine
+5  Mine every layer
+```
+
+The skip and exact-layer prompts accept all of these forms:
+
+```text
+1,2,3,6,8
+1-3,6,8
+1, 2, 5-8, 11
+```
+
+A partially attempted layer is never considered complete. Continue unfinished job schedules it again, together with every layer that had not started. The confirmation screen always lists both scheduled and skipped layers before preflight.

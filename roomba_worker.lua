@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.3.4
+-- Roomba Hive Worker v0.3.5
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.3.4"
+local VERSION = "0.3.5"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -66,10 +66,31 @@ local function parseKey(value)
     return tonumber(value:sub(1, comma - 1)), tonumber(value:sub(comma + 1))
 end
 
+local function copyForSerialization(value, active, path)
+    if type(value) ~= "table" then return value end
+    active = active or {}
+    path = path or "state"
+    if active[value] then error("Cannot save cyclic worker state at " .. path, 0) end
+    active[value] = true
+    local copy = {}
+    for keyValue, item in pairs(value) do
+        local copiedKey = copyForSerialization(keyValue, active, path .. ".<key>")
+        copy[copiedKey] = copyForSerialization(item, active, path .. "." .. tostring(keyValue))
+    end
+    active[value] = nil
+    return copy
+end
+
 local function saveTable(path, value)
     local tmp = path .. ".tmp"
     local handle = assert(fs.open(tmp, "w"))
-    handle.write(textutils.serialize(value))
+    local ok, encoded = pcall(textutils.serialize, copyForSerialization(value))
+    if not ok then
+        handle.close()
+        if fs.exists(tmp) then fs.delete(tmp) end
+        error("Cannot serialize worker state: " .. tostring(encoded), 0)
+    end
+    handle.write(encoded)
     handle.close()
     if fs.exists(path) then fs.delete(path) end
     fs.move(tmp, path)
@@ -206,6 +227,43 @@ local function storageSummary()
     return usedSlots, itemCount
 end
 
+local function compactLayerList(layers)
+    if type(layers) ~= "table" or #layers == 0 then return "-" end
+    local copy = {}
+    for _, layer in ipairs(layers) do copy[#copy + 1] = tonumber(layer) end
+    table.sort(copy)
+    local parts, index = {}, 1
+    while index <= #copy do
+        local first, last = copy[index], copy[index]
+        while index < #copy and copy[index + 1] == last + 1 do
+            index = index + 1
+            last = copy[index]
+        end
+        parts[#parts + 1] = first == last and tostring(first) or (tostring(first) .. "-" .. tostring(last))
+        index = index + 1
+    end
+    return table.concat(parts, ",")
+end
+
+local function assignedLayerList(message)
+    local source = message and message.layerList
+    local output, seen = {}, {}
+    if type(source) == "table" and #source > 0 then
+        for _, value in ipairs(source) do
+            local layer = tonumber(value)
+            if not layer or layer < 1 or layer % 1 ~= 0 then error("Controller sent an invalid layer list.", 0) end
+            if not seen[layer] then seen[layer] = true; output[#output + 1] = layer end
+        end
+        table.sort(output)
+    else
+        local first, last = tonumber(message and message.firstLayer), tonumber(message and message.lastLayer)
+        if not first or not last or first < 1 or last < first then error("Controller sent an invalid layer range.", 0) end
+        for layer = first, last do output[#output + 1] = layer end
+    end
+    if #output == 0 then error("Controller assigned no layers.", 0) end
+    return output
+end
+
 local function renderWorkerScreen(force)
     local now = os.epoch("utc")
     if not force and now - lastUiRender < 500 then return end
@@ -251,7 +309,9 @@ local function renderWorkerScreen(force)
 
     if state.jobId or state.firstLayer or state.layer then
         local range = "-"
-        if state.firstLayer and state.lastLayer then
+        if type(state.layerList) == "table" and #state.layerList > 0 then
+            range = compactLayerList(state.layerList)
+        elseif state.firstLayer and state.lastLayer then
             range = tostring(state.firstLayer) .. "-" .. tostring(state.lastLayer)
         end
         writeLine("Job: " .. tostring(state.jobId or "-") .. " | Range: " .. range)
@@ -1279,6 +1339,7 @@ local function taskHeartbeat()
         total = state.total,
         firstLayer = state.firstLayer,
         lastLayer = state.lastLayer,
+        layerList = state.layerList,
         checkpoint = state.checkpoint,
         recoveryAnchor = state.recoveryAnchor,
         fuelItems = turtle.getItemCount(FUEL_SLOT),
@@ -1639,6 +1700,7 @@ local function clearJobState()
     state.jobId = nil
     state.firstLayer = nil
     state.lastLayer = nil
+    state.layerList = nil
     state.layer = nil
     state.progress = nil
     state.total = nil
@@ -1693,6 +1755,7 @@ local function clearJobForEmergencySurface()
     state.jobId = nil
     state.firstLayer = nil
     state.lastLayer = nil
+    state.layerList = nil
     state.layer = nil
     state.progress = nil
     state.total = nil
@@ -1834,13 +1897,17 @@ end
 local function runSectionWork(message)
     interior = message.map.interior
     bounds = message.map.bounds
+    local layers = assignedLayerList(message)
+    local deepestLayer = layers[#layers]
     state.jobId = message.jobId
-    state.firstLayer = message.firstLayer
-    state.lastLayer = message.lastLayer
+    state.firstLayer = layers[1]
+    state.lastLayer = deepestLayer
+    state.layerList = layers
     state.assignment = {
         jobId = message.jobId,
-        firstLayer = message.firstLayer,
-        lastLayer = message.lastLayer,
+        firstLayer = layers[1],
+        lastLayer = deepestLayer,
+        layerList = { table.unpack(layers) },
         dock = message.dock or dock,
         mapName = message.mapName,
         testRun = message.testRun == true,
@@ -1848,15 +1915,15 @@ local function runSectionWork(message)
     state.jobMap = message.map
     state.error = nil
     persist(true)
-    setStatus("starting", "Building route for layers " .. tostring(message.firstLayer) .. "-" .. tostring(message.lastLayer))
+    setStatus("starting", "Building route for layers " .. compactLayerList(layers))
 
     validateFuelSlot()
     local route, totalMoves = buildRoute()
     if not isUnlimitedFuel() and (fuelLevel() < FUEL_TARGET / 2 or fuelItemsLow()) then
-        refuelAtStation(message.lastLayer * 2 + FUEL_MARGIN)
+        refuelAtStation(deepestLayer * 2 + FUEL_MARGIN)
     end
 
-    for layer = message.firstLayer, message.lastLayer do
+    for _, layer in ipairs(layers) do
         safePoint("starting")
         setStatus("descending", "Descending to layer " .. tostring(layer))
         goCenterForLayer(layer)
@@ -1865,7 +1932,7 @@ local function runSectionWork(message)
 
     clearJobState()
     setStatus("docked", "Docked, unloaded, and ready")
-    send("section_complete", { firstLayer = message.firstLayer, lastLayer = message.lastLayer })
+    send("section_complete", { firstLayer = layers[1], lastLayer = deepestLayer, layerList = layers })
 end
 
 local function recoverAndRetry(message)
@@ -2061,6 +2128,7 @@ local function commandLoop()
                 total = state.total,
                 firstLayer = state.firstLayer,
                 lastLayer = state.lastLayer,
+                layerList = state.layerList,
                 checkpoint = state.checkpoint,
                 recoveryAnchor = state.recoveryAnchor,
                 assignment = state.assignment,
@@ -2211,6 +2279,7 @@ local function commandLoop()
                     total = state.total,
                     firstLayer = state.firstLayer,
                     lastLayer = state.lastLayer,
+                    layerList = state.layerList,
                     checkpoint = state.checkpoint,
                     recoveryAnchor = state.recoveryAnchor,
                     fuelItems = turtle.getItemCount(FUEL_SLOT),

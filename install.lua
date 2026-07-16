@@ -1,8 +1,8 @@
--- Roomba Hive direct transactional installer v0.3.4
+-- Roomba Hive direct transactional installer v0.3.5
 -- Usage: wget run <raw install.lua URL> controller|worker|pocket|reset
 
-local VERSION = "0.3.4"
-local CACHE_TAG = "034"
+local VERSION = "0.3.5"
+local CACHE_TAG = "035"
 local BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
 local ROOT = "/roomba"
 local MANIFEST = fs.combine(ROOT, "update_manifest.db")

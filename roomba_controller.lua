@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.3.4
+-- Roomba Hive Controller v0.3.5
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.3.4"
+local VERSION = "0.3.5"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -230,6 +230,11 @@ local function archiveCurrentJob()
         workerCount = #(state.job.sections or {}),
         testRun = state.job.testRun == true,
         forceClosed = state.job.forceClosed == true,
+        scheduledCount = state.job.scheduledCount or state.job.layers,
+        scheduledLayers = copyForSerialization(state.job.scheduledLayers or {}),
+        layerState = copyForSerialization(state.job.layerState or {}),
+        startedLayers = copyForSerialization(state.job.startedLayers or {}),
+        resumedFromJobId = state.job.resumedFromJobId,
     }
     capList(state.jobHistory, MAX_JOB_HISTORY)
     logEvent(state.job.status == "complete" and "success" or "warning", "job", "Job " .. tostring(state.job.id) .. " finished: " .. tostring(state.job.status), {
@@ -400,6 +405,16 @@ local function printMenuOption(number, label)
     end
 end
 
+local function printWrappedField(label, value)
+    local width = select(1, term.getSize())
+    label = tostring(label or "")
+    local lines = wrapText(tostring(value or ""), math.max(1, width - #label))
+    local continuation = string.rep(" ", #label)
+    for index, line in ipairs(lines) do
+        print((index == 1 and label or continuation) .. line)
+    end
+end
+
 local function workerLabel(worker)
     return titleCase(displayDock(worker.dock)) .. " #" .. tostring(worker.id)
 end
@@ -450,7 +465,7 @@ local function render()
 
     if state.job then
         print("Job: " .. tostring(state.job.mapName))
-        print("Status: " .. tostring(state.job.status) .. " | " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.layers))
+        print("Status: " .. tostring(state.job.status) .. " | " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.scheduledCount or state.job.layers))
     else
         print("Job: none")
         print("Status: idle")
@@ -605,29 +620,204 @@ local function importLegacyMap()
     read()
 end
 
-local function buildSections(layers, workers)
+local function allLayers(totalLayers)
+    local output = {}
+    for layer = 1, totalLayers do output[#output + 1] = layer end
+    return output
+end
+
+local function normalizeLayerList(layers, totalLayers)
+    totalLayers = tonumber(totalLayers)
+    if not totalLayers or totalLayers < 1 or totalLayers % 1 ~= 0 then
+        return nil, "Total layers must be a positive whole number."
+    end
+    if type(layers) ~= "table" then return nil, "Layer selection must be a list." end
+
+    local seen, output = {}, {}
+    for index, value in ipairs(layers) do
+        local layer = tonumber(value)
+        if not layer or layer % 1 ~= 0 then
+            return nil, "Layer entry " .. tostring(index) .. " is not a whole number."
+        end
+        if layer < 1 or layer > totalLayers then
+            return nil, "Layer " .. tostring(layer) .. " is outside 1-" .. tostring(totalLayers) .. "."
+        end
+        if not seen[layer] then
+            seen[layer] = true
+            output[#output + 1] = layer
+        end
+    end
+    table.sort(output)
+    if #output == 0 then return nil, "At least one layer must be scheduled." end
+    return output
+end
+
+local function parseLayerSpec(spec, totalLayers, allowNone)
+    spec = tostring(spec or "")
+    local trimmed = spec:gsub("^%s+", ""):gsub("%s+$", "")
+    if allowNone and (trimmed == "" or trimmed:lower() == "none") then return {} end
+    if trimmed == "" then return nil, "Enter at least one layer." end
+
+    local output = {}
+    local tokenNumber = 0
+    for rawToken in (trimmed .. ","):gmatch("(.-),") do
+        tokenNumber = tokenNumber + 1
+        local token = rawToken:gsub("^%s+", ""):gsub("%s+$", "")
+        if token == "" then
+            return nil, "Entry " .. tostring(tokenNumber) .. " is empty. Remove extra commas."
+        end
+
+        local first, last = token:match("^(%d+)%s*%-%s*(%d+)$")
+        if first then
+            first, last = tonumber(first), tonumber(last)
+            if first > last then
+                return nil, "Range " .. token .. " runs backwards. Use " .. tostring(last) .. "-" .. tostring(first) .. " instead."
+            end
+            for layer = first, last do output[#output + 1] = layer end
+        else
+            local single = token:match("^(%d+)$")
+            if not single then
+                return nil, "Entry '" .. token .. "' is invalid. Use numbers such as 1,2,3 or ranges such as 5-8."
+            end
+            output[#output + 1] = tonumber(single)
+        end
+    end
+
+    if #output == 0 and allowNone then return {} end
+    return normalizeLayerList(output, totalLayers)
+end
+
+local function layerSet(layers)
+    local output = {}
+    for _, layer in ipairs(layers or {}) do output[tonumber(layer)] = true end
+    return output
+end
+
+local function complementLayers(selectedLayers, totalLayers)
+    local selected = layerSet(selectedLayers)
+    local output = {}
+    for layer = 1, totalLayers do
+        if not selected[layer] then output[#output + 1] = layer end
+    end
+    return output
+end
+
+local function compactLayerList(layers)
+    if type(layers) ~= "table" or #layers == 0 then return "none" end
+    local copy = {}
+    for _, layer in ipairs(layers) do copy[#copy + 1] = tonumber(layer) end
+    table.sort(copy)
+    local parts, index = {}, 1
+    while index <= #copy do
+        local first, last = copy[index], copy[index]
+        while index < #copy and copy[index + 1] == last + 1 do
+            index = index + 1
+            last = copy[index]
+        end
+        parts[#parts + 1] = first == last and tostring(first) or (tostring(first) .. "-" .. tostring(last))
+        index = index + 1
+    end
+    return table.concat(parts, ", ")
+end
+
+local function friendlyLayerList(layers)
+    if type(layers) ~= "table" or #layers == 0 then return "none" end
+    if #layers <= 12 then
+        local parts = {}
+        for _, layer in ipairs(layers) do parts[#parts + 1] = tostring(layer) end
+        return table.concat(parts, ", ")
+    end
+    return compactLayerList(layers)
+end
+
+local function layerSelectionKey(layers)
+    local parts = {}
+    for _, layer in ipairs(layers or {}) do parts[#parts + 1] = tostring(layer) end
+    return table.concat(parts, ",")
+end
+
+local function scheduledLayersForJob(job)
+    if not job then return {} end
+    local totalLayers = tonumber(job.layers or 0) or 0
+    if type(job.scheduledLayers) == "table" and #job.scheduledLayers > 0 then
+        local normalized = normalizeLayerList(job.scheduledLayers, totalLayers)
+        if normalized then return normalized end
+    end
+    local output = {}
+    for layer = 1, totalLayers do
+        if not job.layerState or job.layerState[layer] ~= "skipped" then output[#output + 1] = layer end
+    end
+    return output
+end
+
+local function unfinishedPlanFromJob(job)
+    if not job or job.testRun or job.status == "complete"
+        or job.status == "running" or job.status == "paused"
+        or job.status == "aborting" or job.status == "emergency_recovery" then return nil end
+    local totalLayers = tonumber(job.layers or 0) or 0
+    if totalLayers < 1 or not job.mapName then return nil end
+    local scheduled = scheduledLayersForJob(job)
+    local remaining, completed, partial, notStarted = {}, {}, {}, {}
+    for _, layer in ipairs(scheduled) do
+        local status = job.layerState and job.layerState[layer] or nil
+        if status == "complete" then
+            completed[#completed + 1] = layer
+        else
+            remaining[#remaining + 1] = layer
+            if job.startedLayers and job.startedLayers[layer] then partial[#partial + 1] = layer
+            else notStarted[#notStarted + 1] = layer end
+        end
+    end
+    if #remaining == 0 then return nil end
+    return {
+        sourceJobId = job.id,
+        mapName = job.mapName,
+        totalLayers = totalLayers,
+        remainingLayers = remaining,
+        completedLayers = completed,
+        partialLayers = partial,
+        notStartedLayers = notStarted,
+        priorStatus = job.status,
+    }
+end
+
+local function latestUnfinishedJobPlan()
+    local current = unfinishedPlanFromJob(state.job)
+    if current then return current end
+    for index = #state.jobHistory, 1, -1 do
+        local candidate = unfinishedPlanFromJob(state.jobHistory[index])
+        if candidate then return candidate end
+    end
+    return nil
+end
+
+local function buildSections(selectedLayers, workers)
     local sections = {}
-    local activeCount = math.min(layers, #workers)
+    local activeCount = math.min(#selectedLayers, #workers)
     if activeCount <= 0 then return sections end
     for index = 1, activeCount do
         local worker = workers[index]
-        local firstLayer = math.floor((index - 1) * layers / activeCount) + 1
-        local lastLayer = math.floor(index * layers / activeCount)
+        local firstIndex = math.floor((index - 1) * #selectedLayers / activeCount) + 1
+        local lastIndex = math.floor(index * #selectedLayers / activeCount)
+        local assigned = {}
+        for layerIndex = firstIndex, lastIndex do assigned[#assigned + 1] = selectedLayers[layerIndex] end
         sections[#sections + 1] = {
             worker = worker.id,
             dock = worker.dock,
-            first = firstLayer,
-            last = lastLayer,
+            first = assigned[1],
+            last = assigned[#assigned],
+            layers = assigned,
         }
     end
     return sections
 end
 
-local function estimateFuel(map, layers, workerCount)
+local function estimateFuel(map, selectedLayers, workerCount)
     local cells = countMapCells(map)
-    local routeMoves = cells * layers
-    local verticalMoves = layers * (layers + 1) -- descend and ascend each layer.
-    local dockMoves = layers * 2
+    local routeMoves = cells * #selectedLayers
+    local verticalMoves = 0
+    for _, layer in ipairs(selectedLayers) do verticalMoves = verticalMoves + layer * 2 end
+    local dockMoves = #selectedLayers * 2
     local operationalMargin = math.max(96 * math.max(workerCount, 1), math.ceil((routeMoves + verticalMoves + dockMoves) * 0.08))
     local minimum = routeMoves + verticalMoves + dockMoves + operationalMargin
     local multiplier = tonumber(state.config.estimateSafetyMultiplier or 1.25) or 1.25
@@ -635,7 +825,9 @@ local function estimateFuel(map, layers, workerCount)
     local fuelPerItem = tonumber(state.config.fuelItemUnits or COAL_FUEL_UNITS) or COAL_FUEL_UNITS
     return {
         cellsPerLayer = cells,
-        layers = layers,
+        layers = #selectedLayers,
+        selectedCount = #selectedLayers,
+        deepestLayer = selectedLayers[#selectedLayers],
         workers = workerCount,
         minimumUnits = minimum,
         recommendedUnits = recommended,
@@ -645,7 +837,7 @@ local function estimateFuel(map, layers, workerCount)
     }
 end
 
-local function startPreflight(workers, mapName, layers, purpose)
+local function startPreflight(workers, mapName, totalLayers, purpose, selectedLayers)
     local requestId = tostring(nowUtc()) .. "-" .. crypto.randomHex(4)
     local expected = {}
     for _, worker in ipairs(workers) do expected[tostring(worker.id)] = true end
@@ -656,7 +848,9 @@ local function startPreflight(workers, mapName, layers, purpose)
         expected = expected,
         responses = {},
         mapName = mapName,
-        layers = layers,
+        layers = totalLayers,
+        selectedLayers = copyForSerialization(selectedLayers or allLayers(totalLayers)),
+        selectionKey = layerSelectionKey(selectedLayers or allLayers(totalLayers)),
         purpose = purpose or "job",
     }
     saveState()
@@ -754,28 +948,36 @@ local function printPreflight(result)
     end
 end
 
-local function launchJob(name, layers, workers, testRun)
+local function launchJob(name, totalLayers, workers, testRun, selectedLayers, resumedFromJobId)
     local map = loadMap(name)
     if not map then return false, "Map file could not be loaded." end
-    local sections = buildSections(layers, workers)
+    if testRun then totalLayers, selectedLayers = 1, { 1 } end
+    local normalized, selectionError = normalizeLayerList(selectedLayers or allLayers(totalLayers), totalLayers)
+    if not normalized then return false, selectionError end
+
+    local sections = buildSections(normalized, workers)
     if #sections == 0 then return false, "No worker sections could be created." end
+    local selectedSet = layerSet(normalized)
     local layerState = {}
-    for layer = 1, layers do layerState[layer] = "waiting" end
+    for layer = 1, totalLayers do layerState[layer] = selectedSet[layer] and "waiting" or "skipped" end
 
     state.job = {
-        id = tostring(nowUtc()), mapName = name, layers = layers, status = "running",
-        sections = sections, layerState = layerState, completedCount = 0,
-        abortAcks = {}, started = nowUtc(), protocolVersion = PROTOCOL_VERSION,
-        testRun = testRun == true,
+        id = tostring(nowUtc()), mapName = name, layers = totalLayers, status = "running",
+        sections = sections, layerState = layerState, startedLayers = {},
+        scheduledLayers = copyForSerialization(normalized), scheduledCount = #normalized,
+        completedCount = 0, abortAcks = {}, started = nowUtc(),
+        protocolVersion = PROTOCOL_VERSION, testRun = testRun == true,
+        resumedFromJobId = resumedFromJobId,
     }
     state.fuelLock = nil
     for _, section in ipairs(sections) do
-        for layer = section.first, section.last do layerState[layer] = "assigned" end
+        for _, layer in ipairs(section.layers) do layerState[layer] = "assigned" end
         local worker = state.workers[tostring(section.worker)]
         if worker then worker.error = nil end
     end
     logEvent("info", "job", (testRun and "Test run" or "Job") .. " started on map " .. name, {
-        layers = layers, workers = #sections,
+        layers = totalLayers, scheduledLayers = copyForSerialization(normalized), workers = #sections,
+        resumedFromJobId = resumedFromJobId,
     }, true)
     saveState()
 
@@ -786,6 +988,7 @@ local function launchJob(name, layers, workers, testRun)
             mapName = name,
             firstLayer = section.first,
             lastLayer = section.last,
+            layerList = copyForSerialization(section.layers),
             dock = section.dock,
             protocolVersion = PROTOCOL_VERSION,
             testRun = testRun == true,
@@ -796,29 +999,50 @@ local function launchJob(name, layers, workers, testRun)
     return true
 end
 
-local function jobWizard(testRun)
-    if isActiveJob() then print("A job is already active."); sleep(2); return end
-    term.clear(); term.setCursorPos(1, 1)
+local function chooseJobMap()
     local maps = listMaps()
-    if #maps == 0 then print("No maps saved. Calibrate or import first."); sleep(2); return end
-    print(testRun and "ONE-LAYER TEST RUN" or "START QUARRY JOB")
-    for index, name in ipairs(maps) do print(index .. ") " .. name) end
+    if #maps == 0 then print("No maps saved. Calibrate or import first."); sleep(2); return nil end
+    for index, name in ipairs(maps) do printMenuOption(index, name) end
+    printMenuOption("0", "Back")
     write("Map number: ")
-    local name = maps[tonumber(read())]
-    if not name then return end
+    local choice = tonumber(read())
+    if not choice or choice == 0 then return nil end
+    return maps[choice]
+end
 
-    local layers = 1
-    if not testRun then
-        write("Number of layers: ")
-        layers = tonumber(read())
-        if not layers or layers < 1 or layers % 1 ~= 0 then print("Invalid layer count."); sleep(2); return end
+local function promptTotalLayers()
+    write("Total quarry layers: ")
+    local layers = tonumber(read())
+    if not layers or layers < 1 or layers % 1 ~= 0 then
+        print("Enter a positive whole number.")
+        sleep(2)
+        return nil
     end
+    return layers
+end
+
+local function printJobPlan(name, totalLayers, selectedLayers, resumedFromJobId)
+    local skipped = complementLayers(selectedLayers, totalLayers)
+    print("\nJOB PLAN")
+    print(string.rep("=", 32))
+    print("Map: " .. tostring(name))
+    print("Total depth: " .. tostring(totalLayers) .. " layer(s)")
+    printWrappedField("Scheduled (" .. tostring(#selectedLayers) .. "): ", friendlyLayerList(selectedLayers))
+    printWrappedField("Skipped (" .. tostring(#skipped) .. "): ", friendlyLayerList(skipped))
+    if resumedFromJobId then print("Continuing job: " .. tostring(resumedFromJobId)) end
+end
+
+local function runJobPlan(name, totalLayers, selectedLayers, testRun, resumedFromJobId)
+    if isActiveJob() then print("A job is already active."); sleep(2); return end
+    local normalized, selectionError = normalizeLayerList(selectedLayers, totalLayers)
+    if not normalized then printError(selectionError); sleep(3); return end
 
     local workers = {}
     if testRun then
         local chosen = chooseDockedWorker()
         if not chosen then return end
         workers[1] = { id = chosen.id, dock = chosen.dock }
+        totalLayers, normalized = 1, { 1 }
     else
         for _, dock in ipairs(DOCK_ORDER) do
             local id = state.dockOccupancy[dock]
@@ -834,7 +1058,9 @@ local function jobWizard(testRun)
         print("A one-layer test is recommended for this map and hive location,")
         print("but it is not required. The normal preflight will still run.")
     end
-    local estimate = estimateFuel(map, layers, math.min(layers, #workers))
+
+    printJobPlan(name, totalLayers, normalized, resumedFromJobId)
+    local estimate = estimateFuel(map, normalized, math.min(#normalized, #workers))
     print("\nQUARRY ESTIMATE")
     print("Cells per layer: " .. tostring(estimate.cellsPerLayer))
     print("Minimum fuel: " .. tostring(estimate.minimumUnits) .. " units (~" .. tostring(estimate.minimumCoal) .. " coal)")
@@ -842,7 +1068,7 @@ local function jobWizard(testRun)
     print("Estimate assumes " .. tostring(estimate.fuelPerItem) .. " fuel units per coal item.")
 
     print("\nRunning preflight...")
-    startPreflight(workers, name, layers, testRun and "test" or "job")
+    startPreflight(workers, name, totalLayers, testRun and "test" or "job", normalized)
     while state.preflight and not preflightAllResponded(state.preflight) and nowUtc() < state.preflight.deadline do sleep(0.2) end
     local result = evaluatePreflight(state.preflight)
     print("")
@@ -851,13 +1077,98 @@ local function jobWizard(testRun)
 
     write("\nType " .. (testRun and "TEST" or "START") .. " to continue: ")
     if read() ~= (testRun and "TEST" or "START") then return end
-    local ok, err = launchJob(name, layers, workers, testRun)
+    local ok, err = launchJob(name, totalLayers, workers, testRun, normalized, resumedFromJobId)
     if not ok then printError(err); sleep(2); return end
-    print((testRun and "Test run" or "Job") .. " started across " .. tostring(math.min(layers, #workers)) .. " worker(s).")
+    print((testRun and "Test run" or "Job") .. " started across " .. tostring(math.min(#normalized, #workers)) .. " worker(s).")
     print("Press Enter."); read()
+    return true
 end
 
-local function startJob() jobWizard(false) end
+local function jobWizard(testRun)
+    term.clear(); term.setCursorPos(1, 1)
+    print("ONE-LAYER TEST RUN")
+    local name = chooseJobMap()
+    if not name then return end
+    runJobPlan(name, 1, { 1 }, true, nil)
+end
+
+local function startJob()
+    while true do
+        term.clear(); term.setCursorPos(1, 1)
+        print("START A JOB")
+        print(string.rep("=", 32))
+        local unfinished = latestUnfinishedJobPlan()
+        printMenuOption("1", "Continue unfinished job" .. (unfinished and " - available" or " - none available"))
+        printMenuOption("2", "Start from a chosen layer")
+        printMenuOption("3", "Choose layers to skip")
+        printMenuOption("4", "Choose exact layers to mine")
+        printMenuOption("5", "Mine every layer")
+        printMenuOption("0", "Back")
+        write("Choose: ")
+        local choice = read()
+        if choice == "0" or choice == "" then return end
+
+        if choice == "1" then
+            if not unfinished then
+                print("No aborted or unfinished job with remaining layers was found.")
+                sleep(3)
+            else
+                print("\nPREVIOUS JOB")
+                print("Map: " .. tostring(unfinished.mapName))
+                print("Status: " .. tostring(unfinished.priorStatus))
+                printWrappedField("Completed: ", friendlyLayerList(unfinished.completedLayers))
+                printWrappedField("Partially attempted: ", friendlyLayerList(unfinished.partialLayers))
+                printWrappedField("Not started: ", friendlyLayerList(unfinished.notStartedLayers))
+                printWrappedField("Will mine: ", friendlyLayerList(unfinished.remainingLayers))
+                write("Type CONTINUE: ")
+                if read() == "CONTINUE" then
+                    if runJobPlan(unfinished.mapName, unfinished.totalLayers, unfinished.remainingLayers, false, unfinished.sourceJobId) then return end
+                end
+            end
+        elseif choice == "2" or choice == "3" or choice == "4" or choice == "5" then
+            term.clear(); term.setCursorPos(1, 1)
+            print("NEW QUARRY PLAN")
+            local name = chooseJobMap()
+            if name then
+                local totalLayers = promptTotalLayers()
+                if totalLayers then
+                    local selected, problem
+                    if choice == "2" then
+                        write("First layer to mine (1-" .. tostring(totalLayers) .. "): ")
+                        local first = tonumber(read())
+                        if not first or first % 1 ~= 0 or first < 1 or first > totalLayers then
+                            problem = "Starting layer must be a whole number from 1 to " .. tostring(totalLayers) .. "."
+                        else
+                            selected = {}
+                            for layer = first, totalLayers do selected[#selected + 1] = layer end
+                        end
+                    elseif choice == "3" then
+                        print("Enter layers to skip. Individual numbers, ranges, and mixtures are accepted.")
+                        print("Examples: 1,2,3,6,8   or   1-3,6,8   or   1,2,5-8")
+                        write("Skip layers (or none): ")
+                        local skipped
+                        skipped, problem = parseLayerSpec(read(), totalLayers, true)
+                        if skipped then
+                            selected = complementLayers(skipped, totalLayers)
+                            if #selected == 0 then problem = "You skipped every layer. At least one layer must remain." end
+                        end
+                    elseif choice == "4" then
+                        print("Enter the exact layers to mine. Individual numbers, ranges, and mixtures are accepted.")
+                        print("Examples: 4,5,7,9   or   4-5,7,9-25")
+                        write("Mine layers: ")
+                        selected, problem = parseLayerSpec(read(), totalLayers, false)
+                    else
+                        selected = allLayers(totalLayers)
+                    end
+
+                    if problem then printError(problem); sleep(4)
+                    elseif selected and runJobPlan(name, totalLayers, selected, false, nil) then return end
+                end
+            end
+        end
+    end
+end
+
 local function testRun() jobWizard(true) end
 
 local function pauseJob()
@@ -877,7 +1188,7 @@ end
 local function markUnfinishedLayers(status)
     if not state.job or not state.job.layerState then return end
     for layer, layerStatus in pairs(state.job.layerState) do
-        if layerStatus ~= "complete" then state.job.layerState[layer] = status end
+        if layerStatus ~= "complete" and layerStatus ~= "skipped" then state.job.layerState[layer] = status end
     end
 end
 
@@ -1109,8 +1420,13 @@ local function handleMessage(sender, message)
         worker.positionConfidence = message.positionConfidence or worker.positionConfidence
         worker.progress = message.progress or worker.progress
         worker.total = message.total or worker.total
-        worker.firstLayer = message.firstLayer or worker.firstLayer
-        worker.lastLayer = message.lastLayer or worker.lastLayer
+        if isDockedStatus(message.status) then
+            worker.firstLayer, worker.lastLayer, worker.layerList = nil, nil, nil
+        else
+            worker.firstLayer = message.firstLayer or worker.firstLayer
+            worker.lastLayer = message.lastLayer or worker.lastLayer
+            if message.layerList ~= nil then worker.layerList = copyForSerialization(message.layerList) end
+        end
         worker.checkpoint = message.checkpoint and copyForSerialization(message.checkpoint) or worker.checkpoint
         worker.recoveryAnchor = message.recoveryAnchor or worker.recoveryAnchor
         worker.assignment = message.assignment and copyForSerialization(message.assignment) or worker.assignment
@@ -1194,7 +1510,11 @@ local function handleMessage(sender, message)
     elseif message.type == "layer_started" then
         worker.status = "mining"
         worker.layer = message.layer
-        if state.job and state.job.layerState then state.job.layerState[message.layer] = "active" end
+        if state.job and state.job.layerState then
+            state.job.layerState[message.layer] = "active"
+            state.job.startedLayers = state.job.startedLayers or {}
+            state.job.startedLayers[message.layer] = true
+        end
 
     elseif message.type == "layer_complete" then
         worker.status = "returning"
@@ -1202,7 +1522,7 @@ local function handleMessage(sender, message)
         if state.job and state.job.layerState and state.job.layerState[message.layer] ~= "complete" then
             state.job.layerState[message.layer] = "complete"
             state.job.completedCount = (state.job.completedCount or 0) + 1
-            if state.job.completedCount >= state.job.layers then
+            if state.job.completedCount >= (state.job.scheduledCount or state.job.layers) then
                 state.job.status = "complete"
                 if state.job.testRun then
                     markMapTested(state.job.mapName)
@@ -1350,12 +1670,22 @@ local function findWorkerSection(workerId)
     return nil
 end
 
-local function firstIncompleteLayer(section)
-    if not state.job or not section then return nil end
-    for layer = section.first, section.last do
-        if not state.job.layerState or state.job.layerState[layer] ~= "complete" then return layer end
+local function sectionLayerList(section)
+    if not section then return {} end
+    if type(section.layers) == "table" and #section.layers > 0 then return section.layers end
+    local output = {}
+    for layer = tonumber(section.first or 0), tonumber(section.last or -1) do output[#output + 1] = layer end
+    return output
+end
+
+local function incompleteLayersForSection(section)
+    if not state.job or not section then return {} end
+    local output = {}
+    for _, layer in ipairs(sectionLayerList(section)) do
+        local status = state.job.layerState and state.job.layerState[layer] or nil
+        if status ~= "complete" and status ~= "skipped" then output[#output + 1] = layer end
     end
-    return nil
+    return output
 end
 
 local function assignmentForWorker(worker)
@@ -1368,16 +1698,17 @@ local function assignmentForWorker(worker)
     end
     local section = findWorkerSection(worker.id)
     if not section then return nil, "This worker has no section in the current job." end
-    local first = firstIncompleteLayer(section)
-    if not first then return nil, "This worker's assigned layers are already complete." end
+    local remaining = incompleteLayersForSection(section)
+    if #remaining == 0 then return nil, "This worker's assigned layers are already complete." end
     local map = loadMap(state.job.mapName)
     if not map then return nil, "The job map could not be loaded." end
     return {
         jobId = state.job.id,
         map = map,
         mapName = state.job.mapName,
-        firstLayer = first,
-        lastLayer = section.last,
+        firstLayer = remaining[1],
+        lastLayer = remaining[#remaining],
+        layerList = copyForSerialization(remaining),
         dock = section.dock,
         protocolVersion = PROTOCOL_VERSION,
         testRun = state.job.testRun == true,
@@ -1386,10 +1717,9 @@ end
 
 local function markWorkerLayersAssigned(worker)
     local section = findWorkerSection(worker.id)
-    local first = firstIncompleteLayer(section)
-    if not section or not first or not state.job or not state.job.layerState then return end
-    for layer = first, section.last do
-        if state.job.layerState[layer] ~= "complete" then state.job.layerState[layer] = "assigned" end
+    if not section or not state.job or not state.job.layerState then return end
+    for _, layer in ipairs(incompleteLayersForSection(section)) do
+        state.job.layerState[layer] = "assigned"
     end
 end
 
@@ -1409,6 +1739,8 @@ local function workerDetails(worker)
         if worker.updateReason then print("Update wait: " .. tostring(worker.updateReason)) end
     end
     print("Layer: " .. tostring(worker.layer or "-"))
+    local assignedLayers = worker.layerList or (worker.assignment and worker.assignment.layerList)
+    if assignedLayers then printWrappedField("Assigned: ", friendlyLayerList(assignedLayers)) end
     print("Fuel: " .. tostring(worker.fuel or "?") .. " | Slot 1: " .. tostring(worker.fuelItems or "?"))
     print("Empty storage slots: " .. tostring(worker.emptyStorageSlots or "?") .. " | Stored items: " .. tostring(worker.storedItems or "?"))
     if worker.position then print("Position: " .. textutils.serialize(worker.position)) end
@@ -1630,7 +1962,7 @@ local function historyView()
         local job = state.jobHistory[index]
         local seconds = job.finished and job.started and math.floor((job.finished - job.started) / 1000) or 0
         print(string.format("%s | %s | %s/%s | %ss%s",
-            tostring(job.mapName), tostring(job.status), tostring(job.completedCount), tostring(job.layers),
+            tostring(job.mapName), tostring(job.status), tostring(job.completedCount), tostring(job.scheduledCount or job.layers),
             tostring(seconds), job.testRun and " | TEST" or ""))
     end
     print("\nPress Enter."); read()
@@ -2072,7 +2404,7 @@ local function operationsMenu()
         menuHeader("OPERATIONS")
         if state.job then
             print("Job: " .. tostring(state.job.mapName) .. " | " .. tostring(state.job.status))
-            print("Progress: " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.layers))
+            print("Progress: " .. tostring(state.job.completedCount or 0) .. "/" .. tostring(state.job.scheduledCount or state.job.layers))
         else
             print("No active or recorded job.")
         end
@@ -2175,6 +2507,8 @@ local function remoteStatus()
         job = state.job and {
             id = state.job.id, mapName = state.job.mapName, layers = state.job.layers,
             status = state.job.status, completedCount = state.job.completedCount,
+            scheduledCount = state.job.scheduledCount or state.job.layers,
+            scheduledLayers = copyForSerialization(state.job.scheduledLayers or {}),
             testRun = state.job.testRun,
         } or nil,
         workers = workers,
@@ -2187,6 +2521,7 @@ local function remoteStatus()
             id = state.preflight.id,
             mapName = state.preflight.mapName,
             layers = state.preflight.layers,
+            selectedLayers = copyForSerialization(state.preflight.selectedLayers or {}),
             deadline = state.preflight.deadline,
             result = evaluatePreflight(state.preflight),
         } or nil,
@@ -2197,7 +2532,7 @@ local function remoteStatus()
 end
 
 local ACTION_RANK = {
-    status = 1, workers = 1, maps = 1, map_details = 1, history = 1, logs = 1,
+    status = 1, workers = 1, maps = 1, map_details = 1, history = 1, logs = 1, unfinished_job = 1,
     preflight_status = 1, safe_update_status = 1,
     preflight = 2, start_job = 2, pause_hive = 2, resume_hive = 2,
     abort_hive = 2, worker_action = 2,
@@ -2244,11 +2579,25 @@ local function workerActionFromRemote(params)
 end
 
 local function remotePreflight(params)
+    if isActiveJob() then return false, "A job is already active." end
     local mapName = params and params.mapName
-    local layers = tonumber(params and params.layers)
-    if not mapName or not layers or layers < 1 then return false, "Map name and positive layer count are required." end
+    local totalLayers = tonumber(params and params.layers)
+    if not mapName or not totalLayers or totalLayers < 1 or totalLayers % 1 ~= 0 then
+        return false, "Map name and a positive whole-number layer count are required."
+    end
     local map = loadMap(mapName)
     if not map then return false, "Map not found." end
+
+    local selectedLayers
+    if params and params.testRun then
+        totalLayers, selectedLayers = 1, { 1 }
+    else
+        selectedLayers = params and params.selectedLayers or allLayers(totalLayers)
+        local selectionError
+        selectedLayers, selectionError = normalizeLayerList(selectedLayers, totalLayers)
+        if not selectedLayers then return false, selectionError end
+    end
+
     local workers = {}
     if type(params.workerIds) == "table" and #params.workerIds > 0 then
         for _, id in ipairs(params.workerIds) do
@@ -2262,21 +2611,31 @@ local function remotePreflight(params)
             if id then workers[#workers + 1] = { id = id, dock = dock } end
         end
     end
-    if params.testRun and #workers > 1 then workers = { workers[1] }; layers = 1 end
+    if params.testRun and #workers > 1 then workers = { workers[1] } end
     if #workers == 0 then return false, "No docked workers." end
-    startPreflight(workers, mapName, layers, params.testRun and "test" or "remote")
+    startPreflight(workers, mapName, totalLayers, params.testRun and "test" or "remote", selectedLayers)
     return true, {
         requestId = state.preflight.id,
-        estimate = estimateFuel(map, layers, math.min(layers, #workers)),
+        estimate = estimateFuel(map, selectedLayers, math.min(#selectedLayers, #workers)),
+        selectedLayers = copyForSerialization(selectedLayers),
+        skippedLayers = complementLayers(selectedLayers, totalLayers),
         testRecommended = not (params and params.testRun) and not mapTestedForCurrentSite(mapName),
     }
 end
 
 local function remoteStartJob(params)
     if isActiveJob() then return false, "A job is already active." end
+    local totalLayers = tonumber(params and params.layers)
+    local selectedLayers, selectionError = normalizeLayerList(
+        params and params.selectedLayers or allLayers(totalLayers or 0), totalLayers
+    )
+    if not selectedLayers then return false, selectionError end
+
     local preflight = state.preflight
-    if not preflight or preflight.mapName ~= params.mapName or tonumber(preflight.layers) ~= tonumber(params.layers) then
-        return false, "Run a matching preflight first."
+    if not preflight or preflight.mapName ~= params.mapName
+        or tonumber(preflight.layers) ~= totalLayers
+        or tostring(preflight.selectionKey or "") ~= layerSelectionKey(selectedLayers) then
+        return false, "Run a matching preflight for the same layer selection first."
     end
     local result = evaluatePreflight(preflight)
     if not result.ready then return false, "Preflight has not passed." end
@@ -2290,7 +2649,7 @@ local function remoteStartJob(params)
         for index, dock in ipairs(DOCK_ORDER) do if a.dock == dock then ai = index end; if b.dock == dock then bi = index end end
         return ai < bi
     end)
-    return launchJob(params.mapName, tonumber(params.layers), workers, params.testRun == true)
+    return launchJob(params.mapName, totalLayers, workers, params.testRun == true, selectedLayers, params.resumedFromJobId)
 end
 
 local function remoteMapDetails()
@@ -2379,6 +2738,7 @@ local function executeRemoteAction(sender, paired, action, params)
     elseif action == "maps" then return true, listMaps()
     elseif action == "map_details" then return true, remoteMapDetails()
     elseif action == "history" then return true, deepCopy(state.jobHistory)
+    elseif action == "unfinished_job" then return true, latestUnfinishedJobPlan()
     elseif action == "logs" then return true, deepCopy(state.logs)
     elseif action == "preflight_status" then return true, state.preflight and evaluatePreflight(state.preflight) or nil
     elseif action == "safe_update_status" then return true, deepCopy(state.safeUpdate)

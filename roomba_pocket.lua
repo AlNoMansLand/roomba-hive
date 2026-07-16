@@ -1,7 +1,7 @@
--- Roomba Hive Pocket v0.3.4
+-- Roomba Hive Pocket v0.3.5
 -- Secure remote dashboard for an Advanced Wireless/Ender Pocket Computer.
 
-local VERSION = "0.3.4"
+local VERSION = "0.3.5"
 local PROTOCOL_VERSION = 2
 local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
@@ -133,6 +133,99 @@ local function printMenuOption(number, label)
     local lines = wrapText(label, width - #prefix)
     for index, line in ipairs(lines) do
         print((index == 1 and prefix or continuation) .. line)
+    end
+end
+
+local function allLayers(totalLayers)
+    local output = {}
+    for layer = 1, totalLayers do output[#output + 1] = layer end
+    return output
+end
+
+local function normalizeLayerList(layers, totalLayers)
+    totalLayers = tonumber(totalLayers)
+    if not totalLayers or totalLayers < 1 or totalLayers % 1 ~= 0 then return nil, "Total layers must be a positive whole number." end
+    if type(layers) ~= "table" then return nil, "Layer selection must be a list." end
+    local seen, output = {}, {}
+    for index, value in ipairs(layers) do
+        local layer = tonumber(value)
+        if not layer or layer % 1 ~= 0 then return nil, "Layer entry " .. tostring(index) .. " is not a whole number." end
+        if layer < 1 or layer > totalLayers then return nil, "Layer " .. tostring(layer) .. " is outside 1-" .. tostring(totalLayers) .. "." end
+        if not seen[layer] then seen[layer] = true; output[#output + 1] = layer end
+    end
+    table.sort(output)
+    if #output == 0 then return nil, "At least one layer must be scheduled." end
+    return output
+end
+
+local function parseLayerSpec(spec, totalLayers, allowNone)
+    local trimmed = tostring(spec or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if allowNone and (trimmed == "" or trimmed:lower() == "none") then return {} end
+    if trimmed == "" then return nil, "Enter at least one layer." end
+    local output, tokenNumber = {}, 0
+    for rawToken in (trimmed .. ","):gmatch("(.-),") do
+        tokenNumber = tokenNumber + 1
+        local token = rawToken:gsub("^%s+", ""):gsub("%s+$", "")
+        if token == "" then return nil, "Entry " .. tostring(tokenNumber) .. " is empty. Remove extra commas." end
+        local first, last = token:match("^(%d+)%s*%-%s*(%d+)$")
+        if first then
+            first, last = tonumber(first), tonumber(last)
+            if first > last then return nil, "Range " .. token .. " runs backwards." end
+            for layer = first, last do output[#output + 1] = layer end
+        else
+            local single = token:match("^(%d+)$")
+            if not single then return nil, "Entry '" .. token .. "' is invalid." end
+            output[#output + 1] = tonumber(single)
+        end
+    end
+    if #output == 0 and allowNone then return {} end
+    return normalizeLayerList(output, totalLayers)
+end
+
+local function layerSet(layers)
+    local output = {}
+    for _, layer in ipairs(layers or {}) do output[tonumber(layer)] = true end
+    return output
+end
+
+local function complementLayers(selectedLayers, totalLayers)
+    local selected, output = layerSet(selectedLayers), {}
+    for layer = 1, totalLayers do if not selected[layer] then output[#output + 1] = layer end end
+    return output
+end
+
+local function compactLayerList(layers)
+    if type(layers) ~= "table" or #layers == 0 then return "none" end
+    local copy = {}
+    for _, layer in ipairs(layers) do copy[#copy + 1] = tonumber(layer) end
+    table.sort(copy)
+    local parts, index = {}, 1
+    while index <= #copy do
+        local first, last = copy[index], copy[index]
+        while index < #copy and copy[index + 1] == last + 1 do index = index + 1; last = copy[index] end
+        parts[#parts + 1] = first == last and tostring(first) or (tostring(first) .. "-" .. tostring(last))
+        index = index + 1
+    end
+    return table.concat(parts, ", ")
+end
+
+local function friendlyLayerList(layers)
+    if type(layers) ~= "table" or #layers == 0 then return "none" end
+    if #layers <= 12 then
+        local parts = {}
+        for _, layer in ipairs(layers) do parts[#parts + 1] = tostring(layer) end
+        return table.concat(parts, ", ")
+    end
+    return compactLayerList(layers)
+end
+
+local function printWrappedField(label, value)
+    local width = select(1, term.getSize())
+    label = tostring(label or "")
+    local lines = wrapText(tostring(value or ""), math.max(1, width - #label))
+    local continuation = string.rep(" ", #label)
+    for index, line in ipairs(lines) do
+        print((index == 1 and label or continuation) .. line)
     end
 end
 
@@ -384,7 +477,7 @@ local function showOverview()
     print("Controller #" .. tostring(result.controllerId) .. " | v" .. tostring(result.version))
     if result.job then
         print("Job: " .. tostring(result.job.mapName) .. " | " .. tostring(result.job.status))
-        print("Layers: " .. tostring(result.job.completedCount or 0) .. "/" .. tostring(result.job.layers))
+        print("Layers: " .. tostring(result.job.completedCount or 0) .. "/" .. tostring(result.job.scheduledCount or result.job.layers))
     else print("Job: none") end
     print("Fuel lock: " .. tostring(result.fuelLock or "free"))
     print("Relocation: " .. tostring(result.relocationMode))
@@ -411,6 +504,9 @@ local function workerMenu()
         print("Status: " .. tostring(worker.status))
         print("Version/protocol: " .. tostring(worker.version) .. "/" .. tostring(worker.protocolVersion))
         print("Position: " .. tostring(worker.positionConfidence))
+        if worker.layerList and #worker.layerList > 0 then
+            printWrappedField("Assigned: ", friendlyLayerList(worker.layerList))
+        end
         print("Fuel: " .. tostring(worker.fuel) .. " | Slot 1: " .. tostring(worker.fuelItems))
         if worker.error then print("Problem: " .. tostring(worker.error.message or worker.error)) end
         print("")
@@ -450,14 +546,17 @@ local function workerMenu()
     end
 end
 
-local function waitForPreflight(mapName, layers, testRun)
-    local ok, started, err = remoteRequest("preflight", { mapName = mapName, layers = layers, testRun = testRun == true })
+local function waitForPreflight(mapName, layers, selectedLayers, testRun)
+    local ok, started, err = remoteRequest("preflight", { mapName = mapName, layers = layers, selectedLayers = selectedLayers, testRun = testRun == true })
     if not ok then return false, nil, err end
     clear("QUARRY PREFLIGHT")
+    print("Map: " .. tostring(mapName) .. " | Depth: " .. tostring(layers))
     local estimate = started.estimate or {}
     print("Minimum: " .. tostring(estimate.minimumUnits) .. " fuel (~" .. tostring(estimate.minimumCoal) .. " coal)")
     print("Recommended: " .. tostring(estimate.recommendedUnits) .. " fuel (~" .. tostring(estimate.recommendedCoal) .. " coal)")
     print("Coal estimate uses " .. tostring(estimate.fuelPerItem or 80) .. " units/item.")
+    printWrappedField("Mine: ", friendlyLayerList(started.selectedLayers or selectedLayers))
+    printWrappedField("Skip: ", friendlyLayerList(started.skippedLayers or complementLayers(selectedLayers, layers)))
     if started.testRecommended then
         print("")
         print("Optional test not passed.")
@@ -480,6 +579,135 @@ local function waitForPreflight(mapName, layers, testRun)
     return false, nil, "Preflight timed out."
 end
 
+local function choosePocketMap()
+    local ok, maps, err = remoteRequest("map_details")
+    if not ok then printError(err); sleep(2); return nil end
+    clear("SELECT MAP")
+    for index, map in ipairs(maps or {}) do
+        printMenuOption(index, tostring(map.name) .. " | " .. (map.tested and "TESTED" or "UNTESTED"))
+    end
+    printMenuOption("0", "Back")
+    local selected = tonumber(prompt("Map: "))
+    if not selected or selected == 0 then return nil end
+    return maps[selected] and maps[selected].name or nil
+end
+
+local function printPocketPlan(mapName, totalLayers, selectedLayers, resumedFromJobId)
+    clear("JOB PLAN")
+    print("Map: " .. tostring(mapName))
+    print("Total depth: " .. tostring(totalLayers))
+    printWrappedField("Mine (" .. tostring(#selectedLayers) .. "): ", friendlyLayerList(selectedLayers))
+    local skipped = complementLayers(selectedLayers, totalLayers)
+    printWrappedField("Skip (" .. tostring(#skipped) .. "): ", friendlyLayerList(skipped))
+    if resumedFromJobId then print("Continue: " .. tostring(resumedFromJobId)) end
+end
+
+local function startPocketPlan(mapName, totalLayers, selectedLayers, testRun, resumedFromJobId)
+    local normalized, problem = normalizeLayerList(selectedLayers, totalLayers)
+    if not normalized then printError(problem); sleep(3); return end
+    printPocketPlan(mapName, totalLayers, normalized, resumedFromJobId)
+    local passed, _, preflightProblem = waitForPreflight(mapName, totalLayers, normalized, testRun)
+    if not passed then
+        printError(preflightProblem or "Preflight failed.")
+        print("Press Enter.")
+        read()
+        return
+    end
+    local word = testRun and "TEST" or "START"
+    if prompt("Type " .. word .. ": ") ~= word then return end
+    local started, _, startError = remoteRequest("start_job", {
+        mapName = mapName,
+        layers = totalLayers,
+        selectedLayers = normalized,
+        testRun = testRun == true,
+        resumedFromJobId = resumedFromJobId,
+    })
+    print(started and "Job started." or tostring(startError))
+    sleep(2)
+    return started == true
+end
+
+local function startQuarryMenu()
+    while true do
+        local unfinishedOk, unfinished = remoteRequest("unfinished_job")
+        if not unfinishedOk then unfinished = nil end
+        clear("START A JOB")
+        printMenuOption("1", "Continue unfinished job" .. (unfinished and " - available" or " - none available"))
+        printMenuOption("2", "Start from a chosen layer")
+        printMenuOption("3", "Choose layers to skip")
+        printMenuOption("4", "Choose exact layers to mine")
+        printMenuOption("5", "Mine every layer")
+        printMenuOption("0", "Back")
+        local choice = prompt("Choose: ")
+        if choice == "0" or choice == "" then return end
+
+        if choice == "1" then
+            if not unfinished then
+                printError("No unfinished job with remaining layers was found.")
+                sleep(3)
+            else
+                clear("CONTINUE JOB")
+                print("Map: " .. tostring(unfinished.mapName))
+                print("Previous status: " .. tostring(unfinished.priorStatus))
+                printWrappedField("Completed: ", friendlyLayerList(unfinished.completedLayers))
+                printWrappedField("Partially attempted: ", friendlyLayerList(unfinished.partialLayers))
+                printWrappedField("Not started: ", friendlyLayerList(unfinished.notStartedLayers))
+                printWrappedField("Will mine: ", friendlyLayerList(unfinished.remainingLayers))
+                if prompt("Type CONTINUE: ") == "CONTINUE" then
+                    if startPocketPlan(
+                        unfinished.mapName,
+                        unfinished.totalLayers,
+                        unfinished.remainingLayers,
+                        false,
+                        unfinished.sourceJobId
+                    ) then return end
+                end
+            end
+        elseif choice == "2" or choice == "3" or choice == "4" or choice == "5" then
+            local mapName = choosePocketMap()
+            if mapName then
+                local totalLayers = tonumber(prompt("Total quarry layers: "))
+                if not totalLayers or totalLayers < 1 or totalLayers % 1 ~= 0 then
+                    printError("Enter a positive whole number.")
+                    sleep(3)
+                else
+                    local selected, problem
+                    if choice == "2" then
+                        local first = tonumber(prompt("First layer to mine: "))
+                        if not first or first % 1 ~= 0 or first < 1 or first > totalLayers then
+                            problem = "Starting layer must be from 1 to " .. tostring(totalLayers) .. "."
+                        else
+                            selected = {}
+                            for layer = first, totalLayers do selected[#selected + 1] = layer end
+                        end
+                    elseif choice == "3" then
+                        clear("SKIP LAYERS")
+                        print("Separate numbers: 1,2,3,6,8")
+                        print("Ranges: 1-3,6,8")
+                        print("Mixed: 1,2,5-8,11")
+                        local skipped
+                        skipped, problem = parseLayerSpec(prompt("Skip (or none): "), totalLayers, true)
+                        if skipped then
+                            selected = complementLayers(skipped, totalLayers)
+                            if #selected == 0 then problem = "At least one layer must remain." end
+                        end
+                    elseif choice == "4" then
+                        clear("EXACT LAYERS")
+                        print("Separate numbers: 4,5,7,9")
+                        print("Ranges: 4-5,7,9-25")
+                        print("Mixed input is accepted.")
+                        selected, problem = parseLayerSpec(prompt("Mine: "), totalLayers, false)
+                    else
+                        selected = allLayers(totalLayers)
+                    end
+                    if problem then printError(problem); sleep(4)
+                    elseif selected and startPocketPlan(mapName, totalLayers, selected, false, nil) then return end
+                end
+            end
+        end
+    end
+end
+
 local function jobsMenu()
     while true do
         clear("JOBS AND MAPS")
@@ -490,32 +718,11 @@ local function jobsMenu()
         printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         if choice == "0" or choice == "" then return
-        elseif choice == "1" or choice == "2" then
-            local ok, maps, err = remoteRequest("map_details")
-            if not ok then printError(err); sleep(2)
-            else
-                for index, map in ipairs(maps or {}) do
-                    print(index .. ") " .. tostring(map.name) .. " | " .. (map.tested and "TESTED" or "UNTESTED"))
-                end
-                local selectedMap = maps[tonumber(prompt("Map: "))]
-                local mapName = selectedMap and selectedMap.name or nil
-                if mapName then
-                    local testRun = choice == "2"
-                    local layers = testRun and 1 or tonumber(prompt("Layers: "))
-                    if layers and layers >= 1 then
-                        local passed, _, problem = waitForPreflight(mapName, layers, testRun)
-                        if passed then
-                            local word = testRun and "TEST" or "START"
-                            if prompt("Type " .. word .. ": ") == word then
-                                local started, _, startError = remoteRequest("start_job", { mapName = mapName, layers = layers, testRun = testRun })
-                                print(started and "Job started." or tostring(startError)); sleep(2)
-                            end
-                        else
-                            printError(problem or "Preflight failed."); print("Press Enter."); read()
-                        end
-                    end
-                end
-            end
+        elseif choice == "1" then
+            startQuarryMenu()
+        elseif choice == "2" then
+            local mapName = choosePocketMap()
+            if mapName then startPocketPlan(mapName, 1, { 1 }, true, nil) end
         elseif choice == "3" then
             local ok, maps, err = remoteRequest("map_details")
             clear("MAP LIBRARY")
@@ -531,7 +738,8 @@ local function jobsMenu()
             if not ok then printError(err) else
                 for index = #(history or {}), math.max(1, #(history or {}) - 19), -1 do
                     local job = history[index]
-                    print(tostring(job.mapName) .. " | " .. tostring(job.status) .. " | " .. tostring(job.completedCount) .. "/" .. tostring(job.layers))
+                    print(tostring(job.mapName) .. " | " .. tostring(job.status) .. " | "
+                        .. tostring(job.completedCount) .. "/" .. tostring(job.scheduledCount or job.layers))
                 end
             end
             print("Press Enter."); read()
@@ -817,7 +1025,7 @@ local function renderHome()
     print("Controller: " .. tostring(controller and ("#" .. controller.id) or "none"))
 
     if statusCache and statusCache.job then
-        print("Job: " .. tostring(statusCache.job.status) .. " " .. tostring(statusCache.job.completedCount or 0) .. "/" .. tostring(statusCache.job.layers))
+        print("Job: " .. tostring(statusCache.job.status) .. " " .. tostring(statusCache.job.completedCount or 0) .. "/" .. tostring(statusCache.job.scheduledCount or statusCache.job.layers))
     elseif statusCache then
         print("Job: idle")
     else
