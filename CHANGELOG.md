@@ -1,6 +1,21 @@
 # Changelog
 
-## v0.3.5
+## v0.3.6
+
+- Replaced the Safe Update state machine with worker verification, controller installation, and pocket installation stages.
+- Reset terminal update states when a new Safe Update is prepared.
+- Added direct worker update requests, retries, per-worker status, timeout handling, and target-version confirmation after reboot.
+- Prevented the controller from updating until all assigned workers confirm the target release while docked.
+- Added release discovery from GitHub `install.lua`; v0.3.6 uses `?v=036` now and automatically adopts future incremental tags.
+- Added exact release-tagged installer commands for controller and pocket.
+- Added successful-install marker files so completion works for both version changes and same-version reinstalls.
+- Added a coordinated-target guard which stops installation if GitHub changes releases during an active update.
+- Added controller reconnect waiting, persisted pocket-stage recovery, and target-version verification to the pocket updater.
+- Added pocket and controller versions to the pocket home screen.
+- Prevented the controller installer from rebooting already-verified workers a second time.
+- No map, job, dock, pairing, or protocol migration is required.
+
+## v0.3.6
 
 - Added resumable unfinished-job planning from the saved layer ledger.
 - Added start-from-layer, skip-layer, exact-layer, and mine-all planning modes.
@@ -12,7 +27,7 @@
 - Preserved skipped layers during abort and stored scheduled, started, and completed layer data in job history.
 - No protocol-version bump or reset is required; v0.3.4 saved contiguous jobs remain compatible.
 
-## v0.3.5
+## v0.3.6
 
 - Added emergency straight-up recovery to logical Y=-1 for all connected workers or one selected worker.
 - Added safe mining through ordinary blocks during emergency ascent.
@@ -25,7 +40,7 @@
 - Fixed Safe Update remaining at `committing` after a successful version-changing reboot.
 - No protocol or saved-data migration is required.
 
-## v0.3.5
+## v0.3.6
 
 - Fixed `Cannot serialize table with repeated entries` after Minecraft closes during an active quarry.
 - Controller saves now duplicate shared table references before calling `textutils.serialize`.
@@ -33,7 +48,7 @@
 - Incoming worker position, checkpoint, assignment, and error payloads are copied before being retained.
 - Existing maps, jobs, checkpoints, pairings, and worker assignments remain compatible.
 
-## v0.3.5
+## v0.3.6
 
 - Changed the one-layer test from a startup requirement to an optional safety check.
 - Untested maps now show `UNTESTED (OPTIONAL)` on the controller and `UNTESTED` on the pocket.
@@ -42,7 +57,7 @@
 - Successful tests continue to be recorded for the current hive location.
 - No protocol or data migration is required.
 
-## v0.3.5
+## v0.3.6
 
 - Replaced the crowded controller shortcut wall with six grouped menu categories.
 - Replaced the pocket's two-column home screen with a readable one-column dashboard.

@@ -1,11 +1,12 @@
--- Roomba Hive direct transactional installer v0.3.5
+-- Roomba Hive direct transactional installer v0.3.6
 -- Usage: wget run <raw install.lua URL> controller|worker|pocket|reset
 
-local VERSION = "0.3.5"
-local CACHE_TAG = "035"
+local VERSION = "0.3.6"
+local CACHE_TAG = "036"
 local BASE_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main"
 local ROOT = "/roomba"
 local MANIFEST = fs.combine(ROOT, "update_manifest.db")
+local INSTALL_MARKER = fs.combine(ROOT, "last_install.db")
 local LEGACY_PROTOCOL = "roomba_hive_v1"
 local WORKER_PROTOCOL = "roomba_hive_worker_v2"
 local args = { ... }
@@ -79,6 +80,29 @@ if not files[role] then fail("Usage: install.lua controller|worker|pocket|reset"
 if not http then fail("HTTP is disabled in the CC:Tweaked configuration.") end
 if not fs.exists(ROOT) then fs.makeDir(ROOT) end
 
+local function coordinatedTargetVersion()
+    if role == "controller" then
+        local controllerState = readTable(fs.combine(ROOT, "state.db")) or {}
+        local update = controllerState.safeUpdate
+        if type(update) == "table" and update.stage == "installing_controller" then
+            return update.targetVersion
+        end
+    elseif role == "pocket" then
+        local pocketState = readTable(fs.combine(ROOT, "pocket_state.db")) or {}
+        local update = pocketState.pendingSafeUpdate
+        if type(update) == "table" and update.committed == true then
+            return update.targetVersion
+        end
+    end
+    return nil
+end
+
+local coordinatedTarget = coordinatedTargetVersion()
+if coordinatedTarget and tostring(coordinatedTarget) ~= VERSION then
+    fail("GitHub changed to v" .. VERSION .. " after this Safe Update selected v" .. tostring(coordinatedTarget)
+        .. ". Start Safe Update again so workers, controller, and pocket stay on one release.")
+end
+
 local function cacheUrl(remote)
     return BASE_URL .. "/" .. remote
         .. "?v=" .. CACHE_TAG
@@ -106,7 +130,21 @@ local function knownWorkerIds()
     return result
 end
 
+local function safeUpdateWorkersAlreadyVerified()
+    local controllerState = readTable(fs.combine(ROOT, "state.db")) or {}
+    local update = controllerState.safeUpdate
+    return type(update) == "table"
+        and update.stage == "installing_controller"
+        and update.workersVerified == true
+        and tostring(update.targetVersion or "") == VERSION
+end
+
 local function requestWorkerUpdates()
+    if safeUpdateWorkersAlreadyVerified() then
+        print("Safe Update already verified all workers on v" .. VERSION .. "; skipping duplicate worker reboots.")
+        return
+    end
+
     local modem = peripheral.find("modem", function(_, device)
         return device.isWireless and device.isWireless()
     end)
@@ -125,6 +163,7 @@ local function requestWorkerUpdates()
         protocolVersion = 2,
         cacheTag = CACHE_TAG,
         controller = os.getComputerID(),
+        force = false,
     }
     print("Requesting updates from " .. tostring(#ids) .. " worker(s)...")
     for _, id in ipairs(ids) do
@@ -133,8 +172,11 @@ local function requestWorkerUpdates()
         sleep(0.1)
         rednet.send(id, request, LEGACY_PROTOCOL)
         rednet.send(id, request, WORKER_PROTOCOL)
+        sleep(0.15)
+        rednet.send(id, request, LEGACY_PROTOCOL)
+        rednet.send(id, request, WORKER_PROTOCOL)
     end
-    sleep(1)
+    sleep(2)
 end
 
 local function downloadAll(entries)
@@ -205,6 +247,12 @@ if role == "controller" then requestWorkerUpdates() end
 cleanupTemps(files[role])
 downloadAll(files[role])
 commit(files[role])
+writeTable(INSTALL_MARKER, {
+    role = role,
+    targetVersion = VERSION,
+    cacheTag = CACHE_TAG,
+    installedAt = os.epoch("utc"),
+})
 
 if role == "controller" then os.setComputerLabel("Roomba Hive Controller")
 elseif role == "pocket" then os.setComputerLabel("Roomba Hive Pocket")

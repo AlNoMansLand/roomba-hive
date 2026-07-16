@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.3.5
+-- Roomba Hive Controller v0.3.6
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.3.5"
+local VERSION = "0.3.6"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -9,12 +9,16 @@ local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local HOSTNAME = "roomba-hive"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
 local INSTALL_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua"
+local UPDATE_TAG = "036"
+local UPDATE_WORKER_TIMEOUT_SECONDS = 120
+local UPDATE_RETRY_SECONDS = 6
 local ROOT = "/roomba"
 local MAP_DIR = fs.combine(ROOT, "maps")
 local BACKUP_DIR = fs.combine(ROOT, "backups")
 local STATE_FILE = fs.combine(ROOT, "state.db")
 local BOOT_FILE = fs.combine(ROOT, "boot.lua")
 local CRYPTO_FILE = fs.combine(ROOT, "crypto.lua")
+local INSTALL_MARKER = fs.combine(ROOT, "last_install.db")
 local DOCK_SIDES = { "front", "right", "back", "left" }
 local SIDE_TO_DOCK = { front = "north", right = "east", back = "south", left = "west" }
 local DOCK_ORDER = { "north", "east", "south", "west" }
@@ -107,6 +111,8 @@ end
 
 local state = loadTable(STATE_FILE) or {}
 local savedStateVersion = state.version
+local installMarker = loadTable(INSTALL_MARKER)
+local consumedControllerInstallMarker = false
 state.version = VERSION
 state.maps = state.maps or {}
 state.workers = state.workers or {}
@@ -130,19 +136,42 @@ state.safeUpdate = state.safeUpdate or nil
 state.emergencyRecovery = state.emergencyRecovery or nil
 state.relocationMode = state.relocationMode or false
 
-if state.safeUpdate and state.safeUpdate.stage == "committing"
+if installMarker and installMarker.role == "controller" then
+    state.lastInstall = copyForSerialization(installMarker)
+    if state.safeUpdate
+        and (state.safeUpdate.stage == "installing_controller" or state.safeUpdate.stage == "committing")
+        and tostring(installMarker.targetVersion or "") == tostring(state.safeUpdate.targetVersion or VERSION) then
+        state.safeUpdate.stage = "complete"
+        state.safeUpdate.completedVersion = VERSION
+        state.safeUpdate.controllerVersion = VERSION
+        state.safeUpdate.completedAt = os.epoch("utc")
+    end
+    consumedControllerInstallMarker = true
+    if fs.exists(INSTALL_MARKER) then fs.delete(INSTALL_MARKER) end
+elseif state.safeUpdate and state.safeUpdate.stage == "committing"
     and savedStateVersion and savedStateVersion ~= VERSION then
+    -- Compatibility with v0.3.5, which did not write an installer marker.
     state.safeUpdate.stage = "complete"
     state.safeUpdate.completedVersion = VERSION
+    state.safeUpdate.controllerVersion = VERSION
     state.safeUpdate.completedAt = os.epoch("utc")
 end
 state.version = VERSION
 state.protocolVersion = PROTOCOL_VERSION
 
+if state.safeUpdate and state.safeUpdate.stage == "installing_controller"
+    and state.safeUpdate.workersVerified == true
+    and not installMarker then
+    -- Minecraft may have closed after workers were verified but before wget ran.
+    pendingControllerUpdate = true
+end
+
 local function saveState()
     state.version = VERSION
     atomicSave(STATE_FILE, state)
 end
+
+if consumedControllerInstallMarker then saveState() end
 
 local function deepCopy(value, seen)
     if type(value) ~= "table" then return value end
@@ -1585,16 +1614,28 @@ local function handleMessage(sender, message)
 
     elseif message.type == "update_accepted" then
         worker.status = "updating"
+        if state.safeUpdate and state.safeUpdate.workerUpdates and state.safeUpdate.workerUpdates[key] then
+            state.safeUpdate.workerUpdates[key].status = "downloading"
+            state.safeUpdate.workerUpdates[key].acknowledgedAt = nowUtc()
+        end
         worker.updateTarget = message.targetVersion
         worker.error = nil
 
     elseif message.type == "update_deferred" then
         worker.status = "update_pending"
+        if state.safeUpdate and state.safeUpdate.workerUpdates and state.safeUpdate.workerUpdates[key] then
+            state.safeUpdate.workerUpdates[key].status = "deferred"
+            state.safeUpdate.workerUpdates[key].error = message.reason
+        end
         worker.updateTarget = message.targetVersion
         worker.updateReason = message.reason
 
     elseif message.type == "update_installed" then
         worker.status = "rebooting_after_update"
+        if state.safeUpdate and state.safeUpdate.workerUpdates and state.safeUpdate.workerUpdates[key] then
+            state.safeUpdate.workerUpdates[key].status = "rebooting"
+            state.safeUpdate.workerUpdates[key].installedAt = nowUtc()
+        end
         worker.version = message.targetVersion or worker.version
         worker.updateTarget = nil
         worker.updateReason = nil
@@ -1602,11 +1643,18 @@ local function handleMessage(sender, message)
 
     elseif message.type == "update_current" then
         worker.version = message.targetVersion or message.version or worker.version
+        if state.safeUpdate and state.safeUpdate.workerUpdates and state.safeUpdate.workerUpdates[key] then
+            state.safeUpdate.workerUpdates[key].status = "current"
+        end
         worker.updateTarget = nil
         worker.updateReason = nil
 
     elseif message.type == "update_failed" then
         worker.status = "update_failed"
+        if state.safeUpdate and state.safeUpdate.workerUpdates and state.safeUpdate.workerUpdates[key] then
+            state.safeUpdate.workerUpdates[key].status = "failed"
+            state.safeUpdate.workerUpdates[key].error = message.message or "Worker update failed."
+        end
         worker.updateTarget = message.targetVersion
         worker.error = {
             message = message.message or "Worker update failed.",
@@ -2277,6 +2325,40 @@ local function initiateAbortWithoutPrompt()
     saveState()
 end
 
+local function safeUpdateTerminal(stage)
+    return stage == "complete" or stage == "failed" or stage == "cancelled"
+end
+
+local function controllerInstallerUrl(cacheTag)
+    return INSTALL_URL .. "?v=" .. tostring(cacheTag or UPDATE_TAG)
+end
+
+local function discoverGitHubRelease()
+    if not http then return nil, "HTTP is disabled; the controller cannot check GitHub for an update." end
+    local checkUrl = INSTALL_URL .. "?check=" .. tostring(nowUtc())
+    local response, requestError = http.get(checkUrl)
+    if not response then return nil, "Could not download the GitHub installer: " .. tostring(requestError) end
+    local body = response.readAll()
+    response.close()
+    if not body or body == "" then return nil, "GitHub returned an empty installer." end
+
+    local compiled, syntaxError = load(body, "@roomba_hive_release_check", "t", {})
+    if not compiled then return nil, "The GitHub installer has a syntax error: " .. tostring(syntaxError) end
+
+    local version = body:match('local%s+VERSION%s*=%s*"([^"]+)"')
+    local cacheTag = body:match('local%s+CACHE_TAG%s*=%s*"([^"]+)"')
+    if not version or not cacheTag then
+        return nil, "The GitHub installer does not declare VERSION and CACHE_TAG."
+    end
+
+    return {
+        version = version,
+        cacheTag = cacheTag,
+        installerUrl = controllerInstallerUrl(cacheTag),
+        checkedAt = nowUtc(),
+    }
+end
+
 local function safeUpdateIssues()
     local issues = {}
     for _, entry in ipairs(assignedWorkers()) do
@@ -2297,38 +2379,183 @@ local function safeUpdateIssues()
 end
 
 local function beginSafeUpdate(requestedBy)
-    if state.safeUpdate and state.safeUpdate.stage ~= "failed" and state.safeUpdate.stage ~= "cancelled" then
-        return true, state.safeUpdate
+    if state.safeUpdate and not safeUpdateTerminal(state.safeUpdate.stage) then
+        return true, copyForSerialization(state.safeUpdate)
     end
+
+    local release, discoveryError = discoverGitHubRelease()
+    if not release then return false, discoveryError end
+
     state.safeUpdate = {
+        id = tostring(nowUtc()),
         stage = isActiveJob() and "aborting" or "waiting_docked",
         requestedBy = requestedBy,
         started = nowUtc(),
+        targetVersion = release.version,
+        cacheTag = release.cacheTag,
+        controllerVersionBefore = VERSION,
+        installerUrl = release.installerUrl,
+        releaseCheckedAt = release.checkedAt,
         issues = {},
+        expectedWorkers = {},
+        workerUpdates = {},
     }
     if isActiveJob() then initiateAbortWithoutPrompt() end
-    logEvent("warning", "update", "Safe hive update preparation started" .. (requestedBy and (" by pocket #" .. requestedBy) or "") .. ".", nil)
+    logEvent("warning", "update", "Safe hive update preparation started for v" .. VERSION
+        .. (requestedBy and (" by pocket #" .. requestedBy) or "") .. ".", nil)
     saveState()
-    return true, state.safeUpdate
+    return true, copyForSerialization(state.safeUpdate)
+end
+
+local function sendSafeWorkerUpdateRequests(update, retryOnly)
+    local sent = 0
+    for key, expected in pairs(update.expectedWorkers or {}) do
+        local record = update.workerUpdates[key] or {}
+        update.workerUpdates[key] = record
+        if not retryOnly or record.status ~= "confirmed" then
+            local worker = state.workers[key]
+            send(tonumber(key), "update_request", {
+                version = update.targetVersion,
+                cacheTag = update.cacheTag,
+                safeUpdateId = update.id,
+                force = false,
+            })
+            record.status = record.status == "confirmed" and "confirmed" or "requested"
+            record.requestedAt = nowUtc()
+            record.dock = expected.dock
+            record.versionBefore = record.versionBefore or (worker and worker.version)
+            sent = sent + 1
+        end
+    end
+    update.lastWorkerRequestAt = nowUtc()
+    return sent
+end
+
+local function startSafeWorkerUpdates(update)
+    update.expectedWorkers = {}
+    update.workerUpdates = {}
+    update.workerUpdateStartedAt = nowUtc()
+    update.workerUpdateDeadline = nowUtc() + UPDATE_WORKER_TIMEOUT_SECONDS * 1000
+    update.stage = "updating_workers"
+
+    for _, entry in ipairs(assignedWorkers()) do
+        local key = tostring(entry.id)
+        update.expectedWorkers[key] = { id = entry.id, dock = entry.dock }
+        update.workerUpdates[key] = {
+            id = entry.id,
+            dock = entry.dock,
+            status = "queued",
+            versionBefore = entry.worker and entry.worker.version,
+        }
+    end
+
+    local count = 0
+    for _ in pairs(update.expectedWorkers) do count = count + 1 end
+    if count == 0 then
+        update.workersVerified = true
+        update.stage = "installing_controller"
+        pendingControllerUpdate = true
+        return
+    end
+
+    sendSafeWorkerUpdateRequests(update, false)
+end
+
+local function refreshSafeWorkerUpdates(update)
+    local complete, total = 0, 0
+    local failures = {}
+    for key, expected in pairs(update.expectedWorkers or {}) do
+        total = total + 1
+        local worker = state.workers[key]
+        local record = update.workerUpdates[key] or { id = expected.id, dock = expected.dock }
+        update.workerUpdates[key] = record
+
+        if worker and tostring(worker.version or "") == tostring(update.targetVersion)
+            and isDockedStatus(worker.status)
+            and tonumber(worker.lastSeen or 0) >= tonumber(update.workerUpdateStartedAt or 0) then
+            record.status = "confirmed"
+            record.confirmedAt = record.confirmedAt or nowUtc()
+            record.version = worker.version
+            complete = complete + 1
+        elseif worker and worker.status == "update_failed" then
+            record.status = "failed"
+            local message = type(worker.error) == "table" and worker.error.message or worker.error
+            record.error = tostring(message or "Worker update failed")
+            failures[#failures + 1] = displayDock(expected.dock) .. ": " .. record.error
+        elseif worker and worker.status == "rebooting_after_update" then
+            record.status = "rebooting"
+        elseif worker and worker.status == "updating" then
+            record.status = "downloading"
+        elseif worker and worker.status == "update_pending" then
+            record.status = "deferred"
+            record.error = worker.updateReason
+        elseif not worker or not workerIsActive(expected.id) then
+            record.status = "offline"
+        else
+            record.status = record.status == "confirmed" and "confirmed" or "waiting"
+        end
+    end
+
+    update.workerComplete = complete
+    update.workerTotal = total
+    update.issues = failures
+    return complete, total, failures
+end
+
+local function retrySafeWorkerUpdates(requestedBy)
+    local update = state.safeUpdate
+    if not update or update.stage ~= "worker_update_blocked" then
+        return false, "Worker updates are not waiting for a retry."
+    end
+    if update.requestedBy and requestedBy and tonumber(update.requestedBy) ~= tonumber(requestedBy) then
+        return false, "A different pocket started this safe update."
+    end
+    update.stage = "updating_workers"
+    update.workerUpdateDeadline = nowUtc() + UPDATE_WORKER_TIMEOUT_SECONDS * 1000
+    update.issues = {}
+    sendSafeWorkerUpdateRequests(update, true)
+    saveState()
+    return true, copyForSerialization(update)
 end
 
 local function processSafeUpdate()
     local update = state.safeUpdate
     if not update then return end
+
     if update.stage == "aborting" then
         if not state.job or state.job.status == "aborted" or state.job.status == "complete" then
             update.stage = "waiting_docked"
         end
     end
+
     if update.stage == "waiting_docked" or update.stage == "blocked" then
         local issues = safeUpdateIssues()
         update.issues = issues
         update.stage = #issues == 0 and "ready" or "blocked"
         if update.stage == "ready" and not update.readyAlerted then
             update.readyAlerted = true
-            logEvent("success", "update", "All connected workers are safely docked and ready to update.", nil)
+            logEvent("success", "update", "All workers are safely docked and ready for v" .. update.targetVersion .. ".", nil)
+        end
+    elseif update.stage == "updating_workers" then
+        local complete, total, failures = refreshSafeWorkerUpdates(update)
+        if total == 0 or complete >= total then
+            update.workersVerified = true
+            update.stage = "installing_controller"
+            update.controllerInstallStartedAt = nowUtc()
+            logEvent("success", "update", "All " .. tostring(total) .. " worker(s) confirmed v" .. update.targetVersion
+                .. ". Updating the controller last.", nil)
+            pendingControllerUpdate = true
+        elseif #failures > 0 or nowUtc() >= tonumber(update.workerUpdateDeadline or 0) then
+            update.stage = "worker_update_blocked"
+            if #failures == 0 then
+                update.issues = { "Timed out waiting for all workers to reboot and confirm v" .. update.targetVersion .. "." }
+            end
+            logEvent("error", "update", "Worker update verification is blocked.", { issues = update.issues })
+        elseif nowUtc() - tonumber(update.lastWorkerRequestAt or 0) >= UPDATE_RETRY_SECONDS * 1000 then
+            sendSafeWorkerUpdateRequests(update, true)
         end
     end
+
     saveState()
 end
 
@@ -2337,27 +2564,39 @@ local function commitSafeUpdate(requestedBy)
     if state.safeUpdate.requestedBy and requestedBy and tonumber(state.safeUpdate.requestedBy) ~= tonumber(requestedBy) then
         return false, "A different pocket started this safe update."
     end
-    state.safeUpdate.stage = "committing"
-    pendingControllerUpdate = true
-    logEvent("warning", "update", "Safe hive update committed.", nil)
+    startSafeWorkerUpdates(state.safeUpdate)
+    logEvent("warning", "update", "Safe hive update committed for v" .. state.safeUpdate.targetVersion .. ".", nil)
     saveState()
-    return true
+    return true, copyForSerialization(state.safeUpdate)
+end
+
+local function printSafeWorkerUpdateProgress(update)
+    print("Target: v" .. tostring(update.targetVersion) .. " | Workers: "
+        .. tostring(update.workerComplete or 0) .. "/" .. tostring(update.workerTotal or 0))
+    for _, entry in ipairs(assignedWorkers()) do
+        local record = update.workerUpdates and update.workerUpdates[tostring(entry.id)] or nil
+        print("- " .. displayDock(entry.dock) .. " #" .. tostring(entry.id) .. ": "
+            .. tostring(record and record.status or "waiting"))
+    end
 end
 
 local function updateHive()
     term.clear(); term.setCursorPos(1, 1)
     print("SAFE UPDATE ROOMBA HIVE")
     print("=======================")
-    print("The controller will abort active work, wait for every known worker to return, then require final confirmation.")
+    print("The controller will check the current GitHub installer, then update workers first.")
+    print("The controller and requesting pocket update only after every worker is verified.")
     write("Type PREPARE: ")
     if read() ~= "PREPARE" then return end
-    beginSafeUpdate(nil)
+    local prepared, prepareError = beginSafeUpdate(nil)
+    if not prepared then printError(prepareError); sleep(3); return end
 
     while state.safeUpdate do
         processSafeUpdate()
         term.clear(); term.setCursorPos(1, 1)
         print("SAFE UPDATE ROOMBA HIVE")
         print("Stage: " .. tostring(state.safeUpdate.stage))
+        print("Target: v" .. tostring(state.safeUpdate.targetVersion or VERSION))
         if state.safeUpdate.stage == "aborting" then
             print("Workers are returning and unloading...")
             sleep(1)
@@ -2365,22 +2604,40 @@ local function updateHive()
             print("Waiting for all workers to report docked...")
             sleep(1)
         elseif state.safeUpdate.stage == "blocked" then
-            print("\nUpdate is blocked:")
+            print("\nPreparation is blocked:")
             for _, issue in ipairs(state.safeUpdate.issues or {}) do print("- " .. issue) end
             write("\nPress Enter to recheck or type CANCEL: ")
-            if read() == "CANCEL" then
-                state.safeUpdate.stage = "cancelled"; saveState(); return
-            end
+            if read() == "CANCEL" then state.safeUpdate.stage = "cancelled"; saveState(); return end
         elseif state.safeUpdate.stage == "ready" then
             print("\nAll known workers are online, docked, unloaded, and position-confirmed.")
-            print("The installer will update workers first and this controller last.")
+            print("The controller will update and verify workers before updating itself.")
             write("Type UPDATE: ")
             if read() == "UPDATE" then
                 local ok, err = commitSafeUpdate(nil)
                 if not ok then printError(err); sleep(2) end
+            else
+                return
             end
+        elseif state.safeUpdate.stage == "updating_workers" then
+            printSafeWorkerUpdateProgress(state.safeUpdate)
+            sleep(1)
+        elseif state.safeUpdate.stage == "worker_update_blocked" then
+            printSafeWorkerUpdateProgress(state.safeUpdate)
+            for _, issue in ipairs(state.safeUpdate.issues or {}) do print("- " .. issue) end
+            write("Type RETRY, CANCEL, or press Enter to leave: ")
+            local choice = read()
+            if choice == "RETRY" then retrySafeWorkerUpdates(nil)
+            elseif choice == "CANCEL" then state.safeUpdate.stage = "cancelled"; saveState(); return
+            else return end
+        elseif state.safeUpdate.stage == "installing_controller" then
+            print("All workers confirmed. Running:")
+            print("wget run " .. tostring(state.safeUpdate.installerUrl) .. " controller")
+            sleep(2)
             return
-        elseif state.safeUpdate.stage == "committing" then return
+        elseif state.safeUpdate.stage == "complete" then
+            print("Update complete: controller v" .. tostring(state.safeUpdate.completedVersion or VERSION))
+            sleep(3)
+            return
         else
             print("Update ended: " .. tostring(state.safeUpdate.stage)); sleep(2); return
         end
@@ -2537,7 +2794,7 @@ local ACTION_RANK = {
     preflight = 2, start_job = 2, pause_hive = 2, resume_hive = 2,
     abort_hive = 2, worker_action = 2,
     emergency_surface_hive = 3,
-    safe_update_prepare = 3, safe_update_commit = 3, safe_update_cancel = 3,
+    safe_update_prepare = 3, safe_update_commit = 3, safe_update_retry = 3, safe_update_cancel = 3,
     relocate = 3, backup_create = 3, backup_list = 3, backup_restore = 3,
     security_list = 3, security_rename = 3, security_set_role = 3, security_revoke = 3,
 }
@@ -2741,7 +2998,12 @@ local function executeRemoteAction(sender, paired, action, params)
     elseif action == "unfinished_job" then return true, latestUnfinishedJobPlan()
     elseif action == "logs" then return true, deepCopy(state.logs)
     elseif action == "preflight_status" then return true, state.preflight and evaluatePreflight(state.preflight) or nil
-    elseif action == "safe_update_status" then return true, deepCopy(state.safeUpdate)
+    elseif action == "safe_update_status" then
+        local result = deepCopy(state.safeUpdate or { stage = "idle" })
+        result.controllerVersion = VERSION
+        result.updateTag = UPDATE_TAG
+        result.installerUrl = result.installerUrl or controllerInstallerUrl(result.cacheTag)
+        return true, result
     elseif action == "preflight" then return remotePreflight(params)
     elseif action == "start_job" then return remoteStartJob(params)
     elseif action == "pause_hive" then pauseJob(); return true
@@ -2751,6 +3013,7 @@ local function executeRemoteAction(sender, paired, action, params)
     elseif action == "worker_action" then return workerActionFromRemote(params)
     elseif action == "safe_update_prepare" then return beginSafeUpdate(sender)
     elseif action == "safe_update_commit" then return commitSafeUpdate(sender)
+    elseif action == "safe_update_retry" then return retrySafeWorkerUpdates(sender)
     elseif action == "safe_update_cancel" then
         if state.safeUpdate then state.safeUpdate.stage = "cancelled"; saveState() end
         return true
@@ -2919,11 +3182,15 @@ local function updateLoop()
     while running do
         if pendingControllerUpdate then
             pendingControllerUpdate = false
-            sendAlert("warning", "update", "Controller is beginning the update and will reboot.", nil)
+            state.safeUpdate = state.safeUpdate or {}
+            state.safeUpdate.stage = "installing_controller"
+            state.safeUpdate.controllerInstallStartedAt = nowUtc()
+            state.safeUpdate.installerUrl = state.safeUpdate.installerUrl
+                or controllerInstallerUrl(state.safeUpdate.cacheTag)
+            saveState()
+            sendAlert("warning", "update", "Controller is running the v" .. VERSION .. " installer and will reboot.", nil)
             sleep(1)
-            local separator = INSTALL_URL:find("?", 1, true) and "&" or "?"
-            local url = INSTALL_URL .. separator .. "launch=" .. tostring(nowUtc())
-            local ok = shell.run("wget", "run", url, "controller")
+            local ok = shell.run("wget", "run", state.safeUpdate.installerUrl, "controller")
             if not ok then
                 state.safeUpdate = state.safeUpdate or {}
                 state.safeUpdate.stage = "failed"

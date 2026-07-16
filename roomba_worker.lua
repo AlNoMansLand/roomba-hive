@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.3.5
+-- Roomba Hive Worker v0.3.6
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.3.5"
+local VERSION = "0.3.6"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"

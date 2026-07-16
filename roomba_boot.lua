@@ -1,4 +1,4 @@
--- Roomba Hive transactional boot/rollback helper v0.3.5
+-- Roomba Hive transactional boot/rollback helper v0.3.6
 
 local boot = {}
 local ROOT = "/roomba"

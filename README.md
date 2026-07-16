@@ -1,10 +1,28 @@
-# Roomba Hive v0.3.5
+# Roomba Hive v0.3.6
 
 Roomba Hive is a coordinated quarry system for **CC:Tweaked**. One Advanced Computer manages up to four mining turtles, while an optional Advanced Wireless or Ender Pocket Computer provides a secure remote dashboard.
 
 The project is designed around safe recovery rather than blind movement. Workers report their state, preserve fuel, queue updates until they are docked, and refuse automatic movement when their saved position is not trustworthy.
 
-## What v0.3.5 changes
+## What v0.3.6 changes
+
+- Rebuilt Safe Update as a verified three-stage process: workers first, controller second, pocket last.
+- The controller reads `VERSION` and `CACHE_TAG` from the current GitHub `install.lua`, allowing v0.3.6 to discover future tags such as `037`, `038`, and onward.
+- A previous `complete` update no longer prevents a new update from starting.
+- The controller sends update requests directly to every assigned worker and waits for each one to reboot, reconnect, and report the target version while docked.
+- Failed or timed-out workers block the controller update and can be retried without restarting the preparation phase.
+- The controller runs exactly `wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 controller` after workers are verified.
+- An Administrator pocket waits through the controller reboot, verifies controller v0.3.6, then runs exactly `wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 pocket`.
+- Pocket home now displays both pocket and controller versions.
+- Successful installer markers make same-version reinstalls and version-changing installs report completion reliably.
+- The installer refuses to mix releases if GitHub changes again after Safe Update has already selected a target.
+
+### Important update-source behavior
+
+The `?v=036` value is a cache-busting release tag. It does not select a historical Git commit. Before preparing an update, the controller downloads the current GitHub `install.lua` and reads its declared version and tag. For example, a v0.3.6 controller will automatically use `?v=037` after a v0.3.7 installer is uploaded. The installer still downloads whichever files are currently present on the repository's `main` branch, so upload the complete release before starting Safe Update.
+
+
+## What v0.3.6 changes
 
 - Added a Start a Job submenu with five planning modes: continue unfinished work, start from a chosen layer, skip selected layers, mine exact selected layers, or mine every layer.
 - Layer input accepts separate values (`1,2,3,6,8`), ranges (`1-3,6,8`), mixed input (`1,2,5-8,11`), and harmless spaces.
@@ -17,7 +35,7 @@ The project is designed around safe recovery rather than blind movement. Workers
 - Existing v0.3.4 jobs remain readable; old contiguous jobs are treated as all layers from 1 through their saved depth.
 
 
-## What v0.3.5 changes
+## What v0.3.6 changes
 
 - Reformatted controller and pocket menus so each numbered action has its own row.
 - Long action names wrap underneath their own number with indentation instead of running into the next option.
@@ -31,7 +49,7 @@ The project is designed around safe recovery rather than blind movement. Workers
 - No map, pairing, dock, or protocol reset is required.
 
 
-## What v0.3.5 changes
+## What v0.3.6 changes
 
 - Repairs controller state saving after Minecraft is closed during an active quarry.
 - Recovery, Abort, worker commands, and heartbeat processing no longer fail when runtime tables share references.
@@ -259,7 +277,7 @@ Uploading a file with the same exact name and path replaces the current reposito
 ## Clean controller installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 controller
 ```
 
 ## Clean worker installation
@@ -267,13 +285,13 @@ wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install
 Run this on every turtle:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 worker
 ```
 
 ## Pocket installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 pocket
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 pocket
 ```
 
 ## Updating from v0.3.0 or later
@@ -282,14 +300,14 @@ The safest migration is:
 
 1. Finish or safely abort the current quarry job.
 2. Confirm all workers are physically docked.
-3. Upload every v0.3.5 file to GitHub.
+3. Upload every v0.3.6 file to GitHub.
 4. From the existing controller choose `Operations > Safe update hive`, or use `Quick Actions > Safe update hive` on an Administrator pocket. You may also stop the controller UI and run:
 
 ```text
 roomba update
 ```
 
-The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.5, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
+The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.6, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
 
 A worker that is offline or whose program has fully stopped cannot receive the request. Use the manual worker command above for that turtle.
 
@@ -302,7 +320,7 @@ roomba reset
 Remote installer form:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=035 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=036 reset
 ```
 
 Factory reset deletes programs, maps, jobs, backups, pairings, labels, and device state. It is **not** required for normal updates, relocation, or moving the quarry downward.
@@ -372,7 +390,7 @@ Choose whether to continue unfinished work, start from a chosen layer, skip sele
 
 # 6. Controller interface
 
-The v0.3.5 home screen is intentionally small and groups related actions:
+The v0.3.6 home screen is intentionally small and groups related actions:
 
 ```text
 1  Operations
@@ -945,7 +963,7 @@ Do not force an underground movement command. Manually recover the turtle to its
 Before using valuable terrain:
 
 1. Build the controller with one worker and small output chest.
-2. Install v0.3.5 on controller and worker.
+2. Install v0.3.6 on controller and worker.
 3. Detect the dock.
 4. Calibrate a small disposable closed outline.
 5. Run preflight and confirm the 80-units-per-coal estimate appears.

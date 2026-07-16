@@ -1,11 +1,13 @@
--- Roomba Hive Pocket v0.3.5
+-- Roomba Hive Pocket v0.3.6
 -- Secure remote dashboard for an Advanced Wireless/Ender Pocket Computer.
 
-local VERSION = "0.3.5"
+local VERSION = "0.3.6"
 local PROTOCOL_VERSION = 2
 local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
 local INSTALL_URL = "https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua"
+local UPDATE_TAG = "036"
+local INSTALL_MARKER = fs.combine("/roomba", "last_install.db")
 local ROOT = "/roomba"
 local STATE_FILE = fs.combine(ROOT, "pocket_state.db")
 local CRYPTO_FILE = fs.combine(ROOT, "crypto.lua")
@@ -43,6 +45,14 @@ local function loadTable(path)
 end
 
 local state = loadTable(STATE_FILE) or {}
+local installMarker = loadTable(INSTALL_MARKER)
+local consumedInstallMarker = false
+if installMarker and installMarker.role == "pocket" then
+    state.lastInstall = installMarker
+    state.pendingSafeUpdate = nil
+    consumedInstallMarker = true
+    if fs.exists(INSTALL_MARKER) then fs.delete(INSTALL_MARKER) end
+end
 state.version = VERSION
 state.controllers = state.controllers or {}
 state.activeController = state.activeController or nil
@@ -69,6 +79,8 @@ local function persist()
     state.version = VERSION
     saveTable(STATE_FILE, state)
 end
+
+if consumedInstallMarker then persist() end
 
 local function activeController()
     return state.activeController and state.controllers[tostring(state.activeController)] or nil
@@ -766,39 +778,166 @@ local function safeAbort()
     print(ok and "Abort requested." or tostring(err)); sleep(2)
 end
 
+local function pocketInstallerUrl(cacheTag)
+    return INSTALL_URL .. "?v=" .. tostring(cacheTag or UPDATE_TAG)
+end
+
 local function safeUpdate()
     clear("SAFE HIVE UPDATE")
-    print("This aborts active work, waits for every worker to dock, then updates workers, controller, and this pocket.")
-    if prompt("Type PREPARE: ") ~= "PREPARE" then return end
-    local ok, _, err = remoteRequest("safe_update_prepare")
-    if not ok then printError(err); sleep(2); return end
+    print("The controller checks the current GitHub release.")
+    print("Order: workers, controller, then this pocket.")
 
+    local pending = state.pendingSafeUpdate
+    local committed = pending and pending.committed == true or false
+    if pending then
+        print("Resuming update to v" .. tostring(pending.targetVersion or "?") .. ".")
+    else
+        if prompt("Type PREPARE: ") ~= "PREPARE" then return end
+        local ok, prepared, err = remoteRequest("safe_update_prepare")
+        if not ok then printError(err); sleep(2); return end
+        pending = {
+            targetVersion = prepared and prepared.targetVersion,
+            cacheTag = prepared and prepared.cacheTag,
+            startedAt = os.epoch("utc"),
+            committed = prepared and (prepared.stage == "updating_workers" or prepared.stage == "installing_controller") or false,
+        }
+        state.pendingSafeUpdate = pending
+        persist()
+        committed = pending.committed
+    end
+
+    local disconnectedSince = nil
     while true do
-        local statusOk, update, statusError = remoteRequest("safe_update_status", {}, 4)
-        clear("SAFE HIVE UPDATE")
-        if not statusOk then printError(statusError); sleep(2); return end
-        update = update or {}
-        print("Stage: " .. tostring(update.stage))
-        if update.stage == "aborting" then print("Workers are returning and unloading...")
-        elseif update.stage == "waiting_docked" then print("Waiting for dock confirmations...")
-        elseif update.stage == "blocked" then
-            print("Update blocked:")
-            for _, issue in ipairs(update.issues or {}) do print("- " .. issue) end
-            print("Resolve the issue; this screen will recheck.")
-        elseif update.stage == "ready" then
-            print("All workers are safely docked and ready.")
-            if prompt("Type UPDATE: ") ~= "UPDATE" then remoteRequest("safe_update_cancel"); return end
-            local committed, _, commitError = remoteRequest("safe_update_commit")
-            if not committed then printError(commitError); sleep(2); return end
-            print("Controller update committed. Updating this pocket last...")
-            sleep(3)
-            local separator = INSTALL_URL:find("?", 1, true) and "&" or "?"
-            shell.run("wget", "run", INSTALL_URL .. separator .. "launch=" .. tostring(os.epoch("utc")), "pocket")
-            return
-        elseif update.stage == "failed" or update.stage == "cancelled" then
-            print("Update ended: " .. tostring(update.error or update.stage)); sleep(3); return
+        local statusOk, update, statusError = remoteRequest("safe_update_status", {}, 5)
+        if not statusOk then
+            if committed then
+                disconnectedSince = disconnectedSince or os.epoch("utc")
+                clear("SAFE HIVE UPDATE")
+                print("Controller is updating or rebooting...")
+                print("Waiting for it to return on v" .. tostring(pending.targetVersion or "?") .. ".")
+                print("This pocket will update itself last.")
+                if os.epoch("utc") - disconnectedSince > 180000 then
+                    printError("Controller did not return within three minutes: " .. tostring(statusError))
+                    sleep(4)
+                    return
+                end
+                sleep(2)
+            else
+                printError(statusError)
+                sleep(2)
+                return
+            end
+        else
+            disconnectedSince = nil
+            update = update or {}
+            pending.targetVersion = update.targetVersion or pending.targetVersion
+            pending.cacheTag = update.cacheTag or pending.cacheTag
+            state.pendingSafeUpdate = pending
+            persist()
+
+            clear("SAFE HIVE UPDATE")
+            print("Stage: " .. tostring(update.stage))
+            print("Target: v" .. tostring(pending.targetVersion or "?"))
+            print("Controller: v" .. tostring(update.controllerVersion or "?"))
+
+            if update.stage == "aborting" then
+                print("Workers are returning and unloading...")
+            elseif update.stage == "waiting_docked" then
+                print("Waiting for dock confirmations...")
+            elseif update.stage == "blocked" then
+                print("Preparation blocked:")
+                for _, issue in ipairs(update.issues or {}) do print("- " .. issue) end
+                print("Resolve the issue; this screen will recheck.")
+            elseif update.stage == "ready" then
+                print("All workers are safely docked and ready.")
+                print("Controller command later:")
+                print("wget run " .. tostring(update.installerUrl) .. " controller")
+                if prompt("Type UPDATE: ") ~= "UPDATE" then
+                    remoteRequest("safe_update_cancel")
+                    state.pendingSafeUpdate = nil
+                    persist()
+                    return
+                end
+                local committedOk, result, commitError = remoteRequest("safe_update_commit")
+                if not committedOk then printError(commitError); sleep(2); return end
+                committed = true
+                pending.committed = true
+                if result then
+                    pending.targetVersion = result.targetVersion or pending.targetVersion
+                    pending.cacheTag = result.cacheTag or pending.cacheTag
+                end
+                state.pendingSafeUpdate = pending
+                persist()
+            elseif update.stage == "updating_workers" then
+                committed = true
+                pending.committed = true
+                state.pendingSafeUpdate = pending
+                persist()
+                print("Workers confirmed: " .. tostring(update.workerComplete or 0) .. "/" .. tostring(update.workerTotal or 0))
+                for _, record in pairs(update.workerUpdates or {}) do
+                    print("- " .. tostring(record.dock or record.id) .. ": " .. tostring(record.status or "waiting"))
+                end
+            elseif update.stage == "worker_update_blocked" then
+                committed = true
+                print("Worker update verification is blocked:")
+                for _, issue in ipairs(update.issues or {}) do print("- " .. issue) end
+                local choice = prompt("RETRY, CANCEL, or Enter to leave: ")
+                if choice == "RETRY" then
+                    local retryOk, _, retryError = remoteRequest("safe_update_retry")
+                    if not retryOk then printError(retryError); sleep(2); return end
+                elseif choice == "CANCEL" then
+                    remoteRequest("safe_update_cancel")
+                    state.pendingSafeUpdate = nil
+                    persist()
+                    return
+                else
+                    return
+                end
+            elseif update.stage == "installing_controller" or update.stage == "committing" then
+                committed = true
+                pending.committed = true
+                state.pendingSafeUpdate = pending
+                persist()
+                print("Workers are verified.")
+                print("Controller is running:")
+                print("wget run " .. tostring(update.installerUrl) .. " controller")
+            elseif update.stage == "complete" then
+                committed = true
+                local targetVersion = tostring(pending.targetVersion or update.targetVersion or "")
+                local controllerVersion = tostring(update.controllerVersion or update.completedVersion or "")
+                if controllerVersion ~= targetVersion then
+                    printError("Controller reports v" .. (controllerVersion ~= "" and controllerVersion or "?")
+                        .. " instead of target v" .. (targetVersion ~= "" and targetVersion or "?") .. ". Pocket update stopped.")
+                    sleep(4)
+                    return
+                end
+                local cacheTag = pending.cacheTag or update.cacheTag or UPDATE_TAG
+                local url = pocketInstallerUrl(cacheTag)
+                print("Workers and controller confirmed v" .. targetVersion .. ".")
+                print("Updating this pocket last with:")
+                print("wget run " .. url .. " pocket")
+                sleep(2)
+                local installed = shell.run("wget", "run", url, "pocket")
+                if not installed then
+                    printError("Pocket installer did not complete. Reopen Safe Update to retry the pocket stage.")
+                    sleep(4)
+                end
+                return
+            elseif update.stage == "failed" or update.stage == "cancelled" then
+                print("Update ended: " .. tostring(update.error or update.stage))
+                state.pendingSafeUpdate = nil
+                persist()
+                sleep(3)
+                return
+            elseif update.stage == "idle" then
+                printError("The controller has no active safe update.")
+                state.pendingSafeUpdate = nil
+                persist()
+                sleep(3)
+                return
+            end
+            sleep(1)
         end
-        sleep(1)
     end
 end
 
@@ -1021,8 +1160,10 @@ end
 local function renderHome()
     clear("ROOMBA HIVE")
     local controller = activeController()
-    print("Pocket #" .. os.getComputerID() .. " | " .. tostring(controller and controller.role or "unpaired"))
-    print("Controller: " .. tostring(controller and ("#" .. controller.id) or "none"))
+    print("Pocket: #" .. os.getComputerID() .. " v" .. VERSION)
+    print("Role: " .. tostring(controller and controller.role or "unpaired"))
+    print("Controller: " .. tostring(controller and ("#" .. controller.id) or "none")
+        .. " v" .. tostring(statusCache and statusCache.version or "?"))
 
     if statusCache and statusCache.job then
         print("Job: " .. tostring(statusCache.job.status) .. " " .. tostring(statusCache.job.completedCount or 0) .. "/" .. tostring(statusCache.job.scheduledCount or statusCache.job.layers))
