@@ -1,7 +1,7 @@
--- Roomba Hive Pocket v0.3.2
+-- Roomba Hive Pocket v0.3.4
 -- Secure remote dashboard for an Advanced Wireless/Ender Pocket Computer.
 
-local VERSION = "0.3.2"
+local VERSION = "0.3.4"
 local PROTOCOL_VERSION = 2
 local REMOTE_PROTOCOL = "roomba_hive_remote_v1"
 local REMOTE_HOSTNAME = "roomba-hive-remote"
@@ -95,6 +95,44 @@ local function clear(title)
         print(title)
         term.setTextColor(colors.white)
         print(string.rep("=", math.min(#title, select(1, term.getSize()))))
+    end
+end
+
+local function wrapText(text, width)
+    text = tostring(text or "")
+    width = math.max(1, tonumber(width) or 1)
+    local lines, current = {}, ""
+
+    for word in text:gmatch("%S+") do
+        if #word > width then
+            if current ~= "" then lines[#lines + 1] = current; current = "" end
+            local index = 1
+            while index <= #word do
+                lines[#lines + 1] = word:sub(index, index + width - 1)
+                index = index + width
+            end
+        elseif current == "" then
+            current = word
+        elseif #current + 1 + #word <= width then
+            current = current .. " " .. word
+        else
+            lines[#lines + 1] = current
+            current = word
+        end
+    end
+
+    if current ~= "" then lines[#lines + 1] = current end
+    if #lines == 0 then lines[1] = "" end
+    return lines
+end
+
+local function printMenuOption(number, label)
+    local width = select(1, term.getSize())
+    local prefix = tostring(number) .. "  "
+    local continuation = string.rep(" ", #prefix)
+    local lines = wrapText(label, width - #prefix)
+    for index, line in ipairs(lines) do
+        print((index == 1 and prefix or continuation) .. line)
     end
 end
 
@@ -359,8 +397,8 @@ local function chooseWorker()
     local ok, workers, err = remoteRequest("workers")
     if not ok then printError(err); sleep(2); return nil end
     clear("WORKERS")
-    for index, worker in ipairs(workers or {}) do print(index .. ") " .. statusLine(worker)) end
-    print("0) Back")
+    for index, worker in ipairs(workers or {}) do printMenuOption(index, statusLine(worker)) end
+    printMenuOption("0", "Back")
     local selected = tonumber(prompt("Worker: "))
     return selected and workers[selected] or nil
 end
@@ -376,19 +414,30 @@ local function workerMenu()
         print("Fuel: " .. tostring(worker.fuel) .. " | Slot 1: " .. tostring(worker.fuelItems))
         if worker.error then print("Problem: " .. tostring(worker.error.message or worker.error)) end
         print("")
-        print("1 Refresh   2 Pause    3 Resume")
-        print("4 Return    5 Recover/retry")
-        print("6 Restart   7 Recover checkpoint")
-        print("8 Clear error   0 Back")
+        printMenuOption("1", "Refresh status")
+        printMenuOption("2", "Pause worker")
+        printMenuOption("3", "Resume worker")
+        printMenuOption("4", "Return to dock")
+        printMenuOption("5", "Recover and retry")
+        printMenuOption("6", "Restart unfinished work")
+        printMenuOption("7", "Recover saved checkpoint")
+        printMenuOption("8", "Clear displayed error")
+        printMenuOption("9", "Emergency vertical recovery")
+        printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         if choice ~= "0" and choice ~= "" then
             local actions = {
                 ["1"] = "refresh", ["2"] = "pause", ["3"] = "resume", ["4"] = "return",
-                ["5"] = "recover_retry", ["6"] = "restart", ["7"] = "recover_checkpoint", ["8"] = "clear_error",
+                ["5"] = "recover_retry", ["6"] = "restart", ["7"] = "recover_checkpoint",
+                ["8"] = "clear_error", ["9"] = "emergency_surface",
             }
             local action = actions[choice]
             if action then
-                if action == "return" or action == "recover_retry" or action == "restart" or action == "recover_checkpoint" then
+                if action == "emergency_surface" then
+                    print("This mines straight upward and stops at logical Y=-1.")
+                    local confirmation = prompt("Type SURFACE: ")
+                    if confirmation ~= "SURFACE" then action = nil end
+                elseif action == "return" or action == "recover_retry" or action == "restart" or action == "recover_checkpoint" then
                     local confirmation = prompt("Type CONFIRM: ")
                     if confirmation ~= "CONFIRM" then action = nil end
                 end
@@ -434,11 +483,11 @@ end
 local function jobsMenu()
     while true do
         clear("JOBS AND MAPS")
-        print("1) Start quarry job")
-        print("2) Optional one-layer test")
-        print("3) View maps")
-        print("4) Job history")
-        print("0) Back")
+        printMenuOption("1", "Start quarry job")
+        printMenuOption("2", "Optional one-layer test")
+        printMenuOption("3", "View maps")
+        printMenuOption("4", "Job history")
+        printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         if choice == "0" or choice == "" then return
         elseif choice == "1" or choice == "2" then
@@ -492,8 +541,8 @@ end
 
 local function pauseResumeMenu()
     clear("PAUSE / RESUME")
-    print("1) Pause entire hive")
-    print("2) Resume entire hive")
+    printMenuOption("1", "Pause entire hive")
+    printMenuOption("2", "Resume entire hive")
     local action = ({ ["1"] = "pause_hive", ["2"] = "resume_hive" })[prompt("Choose: ")]
     if action then
         local ok, _, err = remoteRequest(action)
@@ -548,12 +597,12 @@ end
 local function alertSettingsMenu()
     while true do
         clear("ALERT SETTINGS")
-        print("1) Errors:   " .. (state.alertSettings.error and "ON" or "OFF"))
-        print("2) Warnings: " .. (state.alertSettings.warning and "ON" or "OFF"))
-        print("3) Success:  " .. (state.alertSettings.success and "ON" or "OFF"))
-        print("4) Info:     " .. (state.alertSettings.info and "ON" or "OFF"))
-        print("5) Sound:    " .. (state.alertSettings.sound and "ON" or "OFF") .. (alertSpeaker and "" or " (no speaker detected)"))
-        print("0) Back")
+        printMenuOption("1", "Errors: " .. (state.alertSettings.error and "ON" or "OFF"))
+        printMenuOption("2", "Warnings: " .. (state.alertSettings.warning and "ON" or "OFF"))
+        printMenuOption("3", "Success: " .. (state.alertSettings.success and "ON" or "OFF"))
+        printMenuOption("4", "Info: " .. (state.alertSettings.info and "ON" or "OFF"))
+        printMenuOption("5", "Sound: " .. (state.alertSettings.sound and "ON" or "OFF") .. (alertSpeaker and "" or " - no speaker"))
+        printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         local keys = { ["1"] = "error", ["2"] = "warning", ["3"] = "success", ["4"] = "info", ["5"] = "sound" }
         if choice == "0" or choice == "" then persist(); return end
@@ -593,16 +642,35 @@ local function alertsMenu()
     end
 end
 
+local function emergencySurfaceRecovery()
+    clear("EMERGENCY SURFACE")
+    print("Connected workers mine straight upward and stop at logical Y=-1.")
+    print("")
+    print("Recovery stops before lava, computers, turtles, inventories, and unbreakable blocks.")
+    print("Unfinished quarry work will be abandoned.")
+    if prompt("Type SURFACE: ") ~= "SURFACE" then return end
+
+    local ok, result, err = remoteRequest("emergency_surface_hive")
+    if ok then
+        print("Recovery started.")
+        print("Use Workers or Overview to monitor progress.")
+    else
+        printError(err)
+    end
+    sleep(3)
+end
+
 local function adminMenu()
     local controller = activeController()
     if not controller or roleRank(controller.role) < 3 then printError("Administrator permission required."); sleep(2); return end
     while true do
         clear("ADMIN TOOLS")
-        print("1) Prepare hive relocation")
-        print("2) Create controller backup")
-        print("3) Restore controller backup")
-        print("4) Safe update hive")
-        print("0) Back")
+        printMenuOption("1", "Prepare hive relocation")
+        printMenuOption("2", "Create controller backup")
+        printMenuOption("3", "Restore controller backup")
+        printMenuOption("4", "Safe update hive")
+        printMenuOption("5", "Emergency surface recovery")
+        printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         if choice == "0" or choice == "" then return
         elseif choice == "1" then
@@ -632,7 +700,8 @@ local function adminMenu()
                     end
                 end
             end
-        elseif choice == "4" then safeUpdate() end
+        elseif choice == "4" then safeUpdate()
+        elseif choice == "5" then emergencySurfaceRecovery() end
     end
 end
 
@@ -644,25 +713,28 @@ local function managePairedPockets()
         clear("PAIRED POCKETS")
         if not ok then printError(err); sleep(2); return end
         for index, pocket in ipairs(pockets or {}) do
-            print(index .. ") #" .. tostring(pocket.id) .. " " .. tostring(pocket.name) .. " | " .. tostring(pocket.role) .. (pocket.isCurrent and " | THIS" or ""))
+            printMenuOption(index, "#" .. tostring(pocket.id) .. " " .. tostring(pocket.name)
+                .. " | " .. tostring(pocket.role) .. (pocket.isCurrent and " | THIS" or ""))
         end
-        print("0) Back")
+        printMenuOption("0", "Back")
         local selected = tonumber(prompt("Pocket: "))
         if not selected or selected == 0 then return end
         local pocket = pockets[selected]
         if pocket then
             clear("MANAGE POCKET #" .. tostring(pocket.id))
-            print("1) Rename")
-            print("2) Change role")
-            print("3) Revoke")
-            print("0) Back")
+            printMenuOption("1", "Rename")
+            printMenuOption("2", "Change role")
+            printMenuOption("3", "Revoke")
+            printMenuOption("0", "Back")
             local choice = prompt("Choose: ")
             if choice == "1" then
                 local name = prompt("New name: ")
                 local changed, _, problem = remoteRequest("security_rename", { id = pocket.id, name = name })
                 print(changed and "Pocket renamed." or tostring(problem)); sleep(2)
             elseif choice == "2" then
-                print("1 viewer  2 operator  3 administrator")
+                printMenuOption("1", "Viewer")
+                printMenuOption("2", "Operator")
+                printMenuOption("3", "Administrator")
                 local role = ({ "viewer", "operator", "administrator" })[tonumber(prompt("Role: "))]
                 if role then
                     local changed, _, problem = remoteRequest("security_set_role", { id = pocket.id, role = role })
@@ -685,13 +757,15 @@ local function securityMenu()
         print("Pocket ID: #" .. os.getComputerID())
         print("Controller: " .. (controller and ("#" .. controller.id .. " " .. tostring(controller.name)) or "none"))
         print("Role: " .. tostring(controller and controller.role or "-"))
-        print("1) Change local PIN")
-        print("2) Pair another controller")
-        print("3) Forget active controller")
-        print("4) Lock now")
-        print("5) Idle lock: " .. tostring(state.idleLockSeconds) .. " seconds")
-        if controller and roleRank(controller.role) >= 3 then print("6) Manage controller paired pockets") end
-        print("0) Back")
+        printMenuOption("1", "Change local PIN")
+        printMenuOption("2", "Pair another controller")
+        printMenuOption("3", "Forget active controller")
+        printMenuOption("4", "Lock now")
+        printMenuOption("5", "Idle lock: " .. tostring(state.idleLockSeconds) .. " seconds")
+        if controller and roleRank(controller.role) >= 3 then
+            printMenuOption("6", "Manage controller paired pockets")
+        end
+        printMenuOption("0", "Back")
         local choice = prompt("Choose: ")
         if choice == "0" or choice == "" then return
         elseif choice == "1" then setPin()
@@ -755,12 +829,12 @@ local function renderHome()
     print("Docked: " .. docked .. " | Fuel: " .. fuelState)
     print("Alerts: " .. unreadAlertCount())
     print("")
-    print("1  Quick Actions")
-    print("2  Workers")
-    print("3  Jobs & Maps")
-    print("4  Alerts & Logs")
-    print("5  System")
-    print("0  Lock Pocket")
+    printMenuOption("1", "Quick Actions")
+    printMenuOption("2", "Workers")
+    printMenuOption("3", "Jobs & Maps")
+    printMenuOption("4", "Alerts & Logs")
+    printMenuOption("5", "System")
+    printMenuOption("0", "Lock Pocket")
 end
 
 local function quickActionsMenu()
@@ -782,10 +856,13 @@ local function quickActionsMenu()
         if roleRank(role) >= 2 and (jobStatus == "running" or jobStatus == "paused" or jobStatus == "aborting") then
             add("Safe abort", "abort")
         end
-        if roleRank(role) >= 3 then add("Safe update hive", "update") end
+        if roleRank(role) >= 3 then
+            add("Safe update hive", "update")
+            add("Emergency surface recovery", "surface")
+        end
 
-        for index, option in ipairs(options) do print(index .. "  " .. option.label) end
-        print("0  Back")
+        for index, option in ipairs(options) do printMenuOption(index, option.label) end
+        printMenuOption("0", "Back")
         local choice = tonumber(prompt("Choose: "))
         if not choice or choice == 0 then return end
         local selected = options[choice]
@@ -798,7 +875,8 @@ local function quickActionsMenu()
                 local ok, _, err = remoteRequest("resume_hive")
                 print(ok and "Resume requested." or tostring(err)); sleep(2)
             elseif selected.action == "abort" then safeAbort()
-            elseif selected.action == "update" then safeUpdate() end
+            elseif selected.action == "update" then safeUpdate()
+            elseif selected.action == "surface" then emergencySurfaceRecovery() end
         end
     end
 end
@@ -814,8 +892,8 @@ local function systemMenu()
         if controller and roleRank(controller.role) >= 3 then add("Administrator tools", "admin") end
         add("Pocket security", "security")
         add("Exit program", "exit")
-        for index, option in ipairs(options) do print(index .. "  " .. option.label) end
-        print("0  Back")
+        for index, option in ipairs(options) do printMenuOption(index, option.label) end
+        printMenuOption("0", "Back")
         local choice = tonumber(prompt("Choose: "))
         if not choice or choice == 0 then return end
         local selected = options[choice]

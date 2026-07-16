@@ -1,16 +1,28 @@
-# Roomba Hive v0.3.2
+# Roomba Hive v0.3.4
 
 Roomba Hive is a coordinated quarry system for **CC:Tweaked**. One Advanced Computer manages up to four mining turtles, while an optional Advanced Wireless or Ender Pocket Computer provides a secure remote dashboard.
 
 The project is designed around safe recovery rather than blind movement. Workers report their state, preserve fuel, queue updates until they are docked, and refuse automatic movement when their saved position is not trustworthy.
 
-## What v0.3.2 changes
+## What v0.3.4 changes
 
-- Changed the one-layer test from mandatory to optional.
-- Untested maps now show a recommendation instead of blocking quarry startup.
-- Controller-started and pocket-started jobs both continue through mandatory preflight without test approval.
-- The test remains available and still records a successful check for the current hive location.
-- No maps, jobs, pairings, assignments, or checkpoints are reset by this update.
+- Reformatted controller and pocket menus so each numbered action has its own row.
+- Long action names wrap underneath their own number with indentation instead of running into the next option.
+- The central column below the controller is now safely excavated when a worker enters or leaves it.
+- Central-route excavation still refuses lava, ComputerCraft blocks, chests, barrels, shulker boxes, and detected inventories.
+- Added controller, worker, and secure pocket emergency vertical recovery.
+- Emergency recovery mines straight upward in the turtle's current column and stops at logical `Y=-1`.
+- Emergency recovery saves after every vertical move and can be reissued after an interrupted Minecraft session.
+- Added progress and failure tracking for multi-worker rescue.
+- Fixed a completed Safe Update remaining stuck at `committing` after the new controller boots.
+- No map, pairing, dock, or protocol reset is required.
+
+
+## What v0.3.4 changes
+
+- Repairs controller state saving after Minecraft is closed during an active quarry.
+- Recovery, Abort, worker commands, and heartbeat processing no longer fail when runtime tables share references.
+- No reset or recalibration is required.
 
 ## Core v0.3 features
 
@@ -234,7 +246,7 @@ Uploading a file with the same exact name and path replaces the current reposito
 ## Clean controller installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 controller
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 controller
 ```
 
 ## Clean worker installation
@@ -242,13 +254,13 @@ wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install
 Run this on every turtle:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 worker
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 worker
 ```
 
 ## Pocket installation
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 pocket
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 pocket
 ```
 
 ## Updating from v0.3.0 or later
@@ -257,14 +269,14 @@ The safest migration is:
 
 1. Finish or safely abort the current quarry job.
 2. Confirm all workers are physically docked.
-3. Upload every v0.3.2 file to GitHub.
+3. Upload every v0.3.4 file to GitHub.
 4. From the existing controller choose `Operations > Safe update hive`, or use `Quick Actions > Safe update hive` on an Administrator pocket. You may also stop the controller UI and run:
 
 ```text
 roomba update
 ```
 
-The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.2, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
+The installer broadcasts the update request before replacing the controller files. Each reachable worker downloads v0.3.4, validates it, installs it, and reboots. A pocket-initiated Safe Update updates the pocket last.
 
 A worker that is offline or whose program has fully stopped cannot receive the request. Use the manual worker command above for that turtle.
 
@@ -277,7 +289,7 @@ roomba reset
 Remote installer form:
 
 ```text
-wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=032 reset
+wget run https://raw.githubusercontent.com/AlNoMansLand/roomba-hive/main/install.lua?v=034 reset
 ```
 
 Factory reset deletes programs, maps, jobs, backups, pairings, labels, and device state. It is **not** required for normal updates, relocation, or moving the quarry downward.
@@ -347,7 +359,7 @@ Choose the map and number of layers. The controller performs preflight, displays
 
 # 6. Controller interface
 
-The v0.3.2 home screen is intentionally small and groups related actions:
+The v0.3.4 home screen is intentionally small and groups related actions:
 
 ```text
 1  Operations
@@ -920,7 +932,7 @@ Do not force an underground movement command. Manually recover the turtle to its
 Before using valuable terrain:
 
 1. Build the controller with one worker and small output chest.
-2. Install v0.3.2 on controller and worker.
+2. Install v0.3.4 on controller and worker.
 3. Detect the dock.
 4. Calibrate a small disposable closed outline.
 5. Run preflight and confirm the 80-units-per-coal estimate appears.
@@ -953,3 +965,42 @@ Minecraft and CC:Tweaked were not available in the build environment. The includ
 - Normal built-in mining-turtle behavior is preserved, including its standard non-durability-consuming mining upgrade. No enchanted-tool datapack is included with this release.
 
 Roomba Hive prioritises stopping safely over continuing when its assumptions cannot be proven.
+
+
+## Emergency vertical recovery
+
+Use this only when ordinary Abort or checkpoint recovery cannot return an underground turtle.
+
+From the controller:
+
+```text
+Operations
+Emergency surface recovery
+```
+
+From an Administrator pocket:
+
+```text
+Quick Actions
+Emergency surface recovery
+```
+
+The worker:
+
+1. Remains in its current horizontal column.
+2. Calculates the distance to logical `Y=-1`.
+3. Consumes emergency fuel when needed.
+4. Mines ordinary blocks directly above it.
+5. Saves its position after every upward movement.
+6. Stops at logical `Y=-1`, one block below the controller's level.
+7. Waits to be physically retrieved or repositioned.
+
+It stops instead of breaking:
+
+- lava;
+- turtles and computers;
+- chests, barrels, shulker boxes, and detected inventories;
+- unbreakable blocks;
+- any route for which its storage or fuel is insufficient.
+
+This mode abandons unfinished work and does not move the turtle horizontally back to its dock. After retrieving the turtles, place them at the controller, run Detect docks, and start a new job or restart unfinished layers as appropriate.

@@ -1,6 +1,27 @@
 # Changelog
 
-## v0.3.2
+## v0.3.4
+
+- Added emergency straight-up recovery to logical Y=-1 for all connected workers or one selected worker.
+- Added safe mining through ordinary blocks during emergency ascent.
+- Added protected-block, inventory, lava, fuel, and storage guards to vertical recovery.
+- Added per-move recovery checkpoints and resumable recovery requests.
+- Added controller rescue progress and failure tracking.
+- Allowed workers to safely excavate a blocked central column below the controller.
+- Reformatted controller and pocket menus into one numbered action per row.
+- Added indented wrapping for long option names.
+- Fixed Safe Update remaining at `committing` after a successful version-changing reboot.
+- No protocol or saved-data migration is required.
+
+## v0.3.4
+
+- Fixed `Cannot serialize table with repeated entries` after Minecraft closes during an active quarry.
+- Controller saves now duplicate shared table references before calling `textutils.serialize`.
+- Actual cyclic state is still rejected with a precise error instead of corrupting the state file.
+- Incoming worker position, checkpoint, assignment, and error payloads are copied before being retained.
+- Existing maps, jobs, checkpoints, pairings, and worker assignments remain compatible.
+
+## v0.3.4
 
 - Changed the one-layer test from a startup requirement to an optional safety check.
 - Untested maps now show `UNTESTED (OPTIONAL)` on the controller and `UNTESTED` on the pocket.
@@ -9,7 +30,7 @@
 - Successful tests continue to be recorded for the current hive location.
 - No protocol or data migration is required.
 
-## v0.3.2
+## v0.3.4
 
 - Replaced the crowded controller shortcut wall with six grouped menu categories.
 - Replaced the pocket's two-column home screen with a readable one-column dashboard.

@@ -1,7 +1,7 @@
--- Roomba Hive Controller v0.3.2
+-- Roomba Hive Controller v0.3.4
 -- Runs on an Advanced Computer at logical origin 0,0,0.
 
-local VERSION = "0.3.2"
+local VERSION = "0.3.4"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -53,11 +53,44 @@ ensureDir(ROOT)
 ensureDir(MAP_DIR)
 ensureDir(BACKUP_DIR)
 
+local function copyForSerialization(value, active, path)
+    if type(value) ~= "table" then return value end
+
+    active = active or {}
+    path = path or "state"
+    if active[value] then
+        error("Cannot save cyclic controller state at " .. path, 0)
+    end
+
+    active[value] = true
+    local copy = {}
+    for key, item in pairs(value) do
+        local copiedKey = copyForSerialization(key, active, path .. ".<key>")
+        local copiedValue = copyForSerialization(item, active, path .. "." .. tostring(key))
+        copy[copiedKey] = copiedValue
+    end
+    active[value] = nil
+    return copy
+end
+
 local function atomicSave(path, value)
     local tmp = path .. ".tmp"
     local handle, err = fs.open(tmp, "w")
     if not handle then error("Cannot write " .. path .. ": " .. tostring(err), 0) end
-    handle.write(textutils.serialize(value))
+
+    -- CC:Tweaked's serializer rejects a table referenced from more than one
+    -- location. Runtime messages may legitimately cause those shared
+    -- references, especially after reconnect/recovery. Copy each occurrence
+    -- independently before serializing while still rejecting actual cycles.
+    local serializable = copyForSerialization(value)
+    local ok, encoded = pcall(textutils.serialize, serializable)
+    if not ok then
+        handle.close()
+        if fs.exists(tmp) then fs.delete(tmp) end
+        error("Cannot serialize controller state: " .. tostring(encoded), 0)
+    end
+
+    handle.write(encoded)
     handle.close()
     if fs.exists(path) then fs.delete(path) end
     fs.move(tmp, path)
@@ -73,6 +106,7 @@ local function loadTable(path)
 end
 
 local state = loadTable(STATE_FILE) or {}
+local savedStateVersion = state.version
 state.version = VERSION
 state.maps = state.maps or {}
 state.workers = state.workers or {}
@@ -93,7 +127,15 @@ state.security = state.security or { enabled = true, paired = {} }
 state.security.paired = state.security.paired or {}
 state.preflight = state.preflight or nil
 state.safeUpdate = state.safeUpdate or nil
+state.emergencyRecovery = state.emergencyRecovery or nil
 state.relocationMode = state.relocationMode or false
+
+if state.safeUpdate and state.safeUpdate.stage == "committing"
+    and savedStateVersion and savedStateVersion ~= VERSION then
+    state.safeUpdate.stage = "complete"
+    state.safeUpdate.completedVersion = VERSION
+    state.safeUpdate.completedAt = os.epoch("utc")
+end
 state.version = VERSION
 state.protocolVersion = PROTOCOL_VERSION
 
@@ -320,6 +362,44 @@ local function markMapTested(name)
     return true
 end
 
+local function wrapText(text, width)
+    text = tostring(text or "")
+    width = math.max(1, tonumber(width) or 1)
+    local lines, current = {}, ""
+
+    for word in text:gmatch("%S+") do
+        if #word > width then
+            if current ~= "" then lines[#lines + 1] = current; current = "" end
+            local index = 1
+            while index <= #word do
+                lines[#lines + 1] = word:sub(index, index + width - 1)
+                index = index + width
+            end
+        elseif current == "" then
+            current = word
+        elseif #current + 1 + #word <= width then
+            current = current .. " " .. word
+        else
+            lines[#lines + 1] = current
+            current = word
+        end
+    end
+
+    if current ~= "" then lines[#lines + 1] = current end
+    if #lines == 0 then lines[1] = "" end
+    return lines
+end
+
+local function printMenuOption(number, label)
+    local width = select(1, term.getSize())
+    local prefix = tostring(number) .. "  "
+    local continuation = string.rep(" ", #prefix)
+    local lines = wrapText(label, width - #prefix)
+    for index, line in ipairs(lines) do
+        print((index == 1 and prefix or continuation) .. line)
+    end
+end
+
 local function workerLabel(worker)
     return titleCase(displayDock(worker.dock)) .. " #" .. tostring(worker.id)
 end
@@ -351,7 +431,9 @@ local function controllerSummary()
         elseif status:find("^offline") then
             issues = issues + 1
             attention = attention or (workerLabel(worker) .. " is offline")
-        elseif status == "error" or status == "position_unknown" or status == "recovery_required" or status == "incompatible" then
+        elseif status == "error" or status == "position_unknown" or status == "recovery_required"
+            or status == "surface_recovered" or status == "surface_recovery_paused"
+            or status == "incompatible" then
             issues = issues + 1
             attention = attention or (workerLabel(worker) .. " needs attention")
         end
@@ -378,7 +460,12 @@ local function render()
     print("Workers: " .. tostring(online) .. " online | " .. tostring(docked) .. " docked")
     print("Fuel: " .. fuelState .. " | Issues: " .. tostring(issues))
 
-    if state.relocationMode then
+    if state.emergencyRecovery and state.emergencyRecovery.stage ~= "complete" then
+        local completed, total = 0, 0
+        for _ in pairs(state.emergencyRecovery.expected or {}) do total = total + 1 end
+        for _ in pairs(state.emergencyRecovery.completed or {}) do completed = completed + 1 end
+        print("RESCUE: " .. tostring(completed) .. "/" .. tostring(total) .. " workers surfaced")
+    elseif state.relocationMode then
         print("ATTENTION: relocation mode active")
     elseif attention then
         print("ATTENTION: " .. attention)
@@ -387,13 +474,13 @@ local function render()
     end
 
     print("")
-    print("1  Operations")
-    print("2  Workers")
-    print("3  Jobs & Maps")
-    print("4  Maintenance")
-    print("5  Remote & Security")
-    print("6  Logs & History")
-    print("0  Exit")
+    printMenuOption("1", "Operations")
+    printMenuOption("2", "Workers")
+    printMenuOption("3", "Jobs & Maps")
+    printMenuOption("4", "Maintenance")
+    printMenuOption("5", "Remote & Security")
+    printMenuOption("6", "Logs & History")
+    printMenuOption("0", "Exit")
 end
 
 local function detectDocks()
@@ -863,6 +950,119 @@ local function acknowledgeAbort(sender)
     end
 end
 
+local function emergencyRecoveryCounts(recovery)
+    local total, complete, failed = 0, 0, 0
+    for _ in pairs(recovery and recovery.expected or {}) do total = total + 1 end
+    for _ in pairs(recovery and recovery.completed or {}) do complete = complete + 1 end
+    for _ in pairs(recovery and recovery.failed or {}) do failed = failed + 1 end
+    return complete, total, failed
+end
+
+local function finishEmergencyRecoveryIfDone()
+    local recovery = state.emergencyRecovery
+    if not recovery or recovery.stage == "complete" or recovery.stage == "complete_with_failures" then return end
+    local complete, total, failed = emergencyRecoveryCounts(recovery)
+    if complete + failed < total then return end
+
+    recovery.stage = failed > 0 and "complete_with_failures" or "complete"
+    recovery.completedAt = nowUtc()
+
+    if state.job and state.job.status == "emergency_recovery" then
+        markUnfinishedLayers("aborted")
+        state.job.status = "aborted"
+        state.fuelLock = nil
+        archiveCurrentJob()
+    end
+
+    logEvent(
+        failed > 0 and "warning" or "success",
+        "recovery",
+        "Emergency surface recovery finished: " .. tostring(complete) .. " recovered, " .. tostring(failed) .. " failed.",
+        { recoveryId = recovery.id }
+    )
+end
+
+local function beginEmergencySurfaceRecovery(requestedBy)
+    if state.emergencyRecovery
+        and state.emergencyRecovery.stage ~= "complete"
+        and state.emergencyRecovery.stage ~= "complete_with_failures"
+        and state.emergencyRecovery.stage ~= "cancelled" then
+        return false, "An emergency surface recovery is already active."
+    end
+
+    local recovery = {
+        id = tostring(nowUtc()),
+        stage = "surfacing",
+        requestedBy = requestedBy,
+        startedAt = nowUtc(),
+        expected = {},
+        completed = {},
+        failed = {},
+    }
+
+    for key, worker in pairs(state.workers) do
+        local id = tonumber(worker.id or key)
+        if id and workerIsActive(id) then
+            recovery.expected[tostring(id)] = true
+        end
+    end
+
+    local expectedCount = 0
+    for _ in pairs(recovery.expected) do expectedCount = expectedCount + 1 end
+    if expectedCount == 0 then return false, "No connected workers are available for emergency recovery." end
+
+    state.emergencyRecovery = recovery
+    if state.job and state.job.status ~= "complete" and state.job.status ~= "aborted" then
+        state.job.status = "emergency_recovery"
+        markUnfinishedLayers("recovery_requested")
+    end
+
+    for key in pairs(recovery.expected) do
+        send(tonumber(key), "emergency_surface", {
+            recoveryId = recovery.id,
+            targetY = -1,
+            jobId = state.job and state.job.id,
+        })
+    end
+
+    logEvent(
+        "warning",
+        "recovery",
+        "Emergency vertical recovery started for " .. tostring(expectedCount) .. " connected worker(s).",
+        { recoveryId = recovery.id, requestedBy = requestedBy }
+    )
+    saveState()
+    return true, deepCopy(recovery)
+end
+
+local function emergencySurfaceRecoveryUI()
+    term.clear(); term.setCursorPos(1, 1)
+    print("EMERGENCY SURFACE RECOVERY")
+    print("==========================")
+    print("Connected underground workers will mine straight upward and stop at logical Y=-1.")
+    print("")
+    print("They stop before:")
+    print("- Lava")
+    print("- Turtles or computers")
+    print("- Chests or other inventories")
+    print("- Blocks their tool cannot break")
+    print("")
+    print("This abandons unfinished quarry work. It does not return turtles horizontally to their docks.")
+    write("Type SURFACE: ")
+    if read() ~= "SURFACE" then return end
+
+    local ok, result = beginEmergencySurfaceRecovery(nil)
+    if not ok then
+        printError(result)
+        sleep(3)
+        return
+    end
+
+    print("Recovery command sent to connected workers.")
+    print("Use Workers to view individual progress.")
+    sleep(3)
+end
+
 local function handleMessage(sender, message)
     if type(message) ~= "table" then return end
     local key = tostring(sender)
@@ -905,15 +1105,15 @@ local function handleMessage(sender, message)
         worker.emptyStorageSlots = message.emptyStorageSlots or worker.emptyStorageSlots
         worker.usedStorageSlots = message.usedStorageSlots or worker.usedStorageSlots
         worker.storedItems = message.storedItems or worker.storedItems
-        worker.position = message.position or worker.position
+        worker.position = message.position and copyForSerialization(message.position) or worker.position
         worker.positionConfidence = message.positionConfidence or worker.positionConfidence
         worker.progress = message.progress or worker.progress
         worker.total = message.total or worker.total
         worker.firstLayer = message.firstLayer or worker.firstLayer
         worker.lastLayer = message.lastLayer or worker.lastLayer
-        worker.checkpoint = message.checkpoint or worker.checkpoint
+        worker.checkpoint = message.checkpoint and copyForSerialization(message.checkpoint) or worker.checkpoint
         worker.recoveryAnchor = message.recoveryAnchor or worker.recoveryAnchor
-        worker.assignment = message.assignment or worker.assignment
+        worker.assignment = message.assignment and copyForSerialization(message.assignment) or worker.assignment
         if message.status and message.status ~= "error" and message.status ~= "blocked_waiting" then
             worker.error = nil
         end
@@ -933,6 +1133,37 @@ local function handleMessage(sender, message)
             elseif worker.status == "recovery_required" or worker.status == "position_unknown" then
                 logEvent("error", "recovery", workerLabel(worker) .. " requires position recovery.", { worker = sender })
             end
+        end
+
+    elseif message.type == "worker_surface_started" then
+        worker.status = "emergency_surfacing"
+        worker.position = message.position and copyForSerialization(message.position) or worker.position
+        worker.error = nil
+
+    elseif message.type == "worker_surface_progress" then
+        worker.status = "emergency_surfacing"
+        worker.position = message.position and copyForSerialization(message.position) or worker.position
+        worker.surfaceRemaining = message.remaining
+        if state.emergencyRecovery and tostring(message.recoveryId) == tostring(state.emergencyRecovery.id) then
+            state.emergencyRecovery.lastProgress = nowUtc()
+        end
+
+    elseif message.type == "worker_surface_recovered" then
+        worker.status = message.alreadyDocked and "docked" or "surface_recovered"
+        worker.position = message.position and copyForSerialization(message.position) or worker.position
+        worker.positionConfidence = message.alreadyDocked and "confirmed" or "recoverable"
+        worker.error = message.alreadyDocked and nil or {
+            message = "Recovered at logical Y=-1. Retrieve or reposition this turtle, then Detect docks.",
+            position = message.position,
+        }
+        worker.surfaceRemaining = 0
+        if state.emergencyRecovery and tostring(message.recoveryId) == tostring(state.emergencyRecovery.id) then
+            state.emergencyRecovery.completed[key] = {
+                time = nowUtc(),
+                position = message.position and copyForSerialization(message.position) or nil,
+                note = message.note,
+            }
+            finishEmergencyRecoveryIfDone()
         end
 
     elseif message.type == "preflight_response" then
@@ -1024,7 +1255,7 @@ local function handleMessage(sender, message)
     elseif message.type == "fuel_station_empty" then
         worker.status = "fuel_station_empty"
         worker.fuel = message.fuel or worker.fuel
-        worker.position = message.position or worker.position
+        worker.position = message.position and copyForSerialization(message.position) or worker.position
         worker.error = {
             message = message.message or "RESTOCK FUEL STATION, then restart remaining work.",
             position = message.position,
@@ -1065,7 +1296,16 @@ local function handleMessage(sender, message)
 
     elseif message.type == "worker_error" then
         worker.status = "ERROR: " .. tostring(message.message)
-        worker.error = message
+        if state.emergencyRecovery and state.emergencyRecovery.expected[key]
+            and not state.emergencyRecovery.completed[key] then
+            state.emergencyRecovery.failed[key] = {
+                time = nowUtc(),
+                message = message.message,
+                position = message.position and copyForSerialization(message.position) or nil,
+            }
+            finishEmergencyRecoveryIfDone()
+        end
+        worker.error = copyForSerialization(message)
         if state.fuelLock == sender then state.fuelLock = nil end
         if state.pendingCalibration and sender == state.pendingCalibration.worker then
             state.lastCalibrationResult = { ok = false, message = message.message }
@@ -1185,17 +1425,18 @@ local function workerDetails(worker)
         if worker.error.position then print(textutils.serialize(worker.error.position)) end
     end
     print("")
-    print("1) Refresh / ping")
-    print("2) Recover and retry remaining work")
-    print("3) Return to dock and stop")
-    print("4) Pause this worker")
-    print("5) Resume this worker")
-    print("6) Restart remaining work from dock / after fuel restock")
-    print("7) Clear displayed error")
-    print("8) Forget this worker record")
-    print("9) Recover from saved shaft/centre checkpoint")
-    print("10) Run preflight on this worker")
-    print("0) Back")
+    printMenuOption("1", "Refresh status")
+    printMenuOption("2", "Recover and retry unfinished work")
+    printMenuOption("3", "Return to dock and stop")
+    printMenuOption("4", "Pause worker")
+    printMenuOption("5", "Resume worker")
+    printMenuOption("6", "Restart unfinished work from dock")
+    printMenuOption("7", "Clear displayed error")
+    printMenuOption("8", "Forget worker record")
+    printMenuOption("9", "Recover saved shaft or centre checkpoint")
+    printMenuOption("10", "Run worker preflight")
+    printMenuOption("11", "Emergency vertical recovery to Y=-1")
+    printMenuOption("0", "Back")
     write("Choose: ")
 end
 
@@ -1316,6 +1557,20 @@ local function manageWorker(worker)
                 end
             end
 
+        elseif choice == "11" then
+            print("This mines straight upward from the worker's current column and stops at logical Y=-1.")
+            print("It will not move horizontally or return to the dock.")
+            write("Type SURFACE: ")
+            if read() == "SURFACE" then
+                local recoveryId = tostring(nowUtc())
+                send(worker.id, "emergency_surface", { recoveryId = recoveryId, targetY = -1 })
+                worker.status = "emergency_surfacing"
+                worker.error = nil
+                saveState()
+                print("Emergency recovery command sent.")
+                sleep(2)
+            end
+
         elseif choice == "10" then
             startPreflight({ { id = worker.id, dock = worker.dock } }, nil, 0, "worker")
             while state.preflight and not preflightAllResponded(state.preflight) and nowUtc() < state.preflight.deadline do sleep(0.2) end
@@ -1340,9 +1595,10 @@ local function workersView()
             return
         end
         for index, worker in ipairs(workers) do
-            print(index .. ") " .. workerLabel(worker) .. " | " .. tostring(worker.status or "unknown") .. " | L" .. tostring(worker.layer or "-") .. " | F" .. tostring(worker.fuel or "?"))
+            printMenuOption(index, workerLabel(worker) .. " | " .. tostring(worker.status or "unknown")
+                .. " | L" .. tostring(worker.layer or "-") .. " | F" .. tostring(worker.fuel or "?"))
         end
-        print("0) Back")
+        printMenuOption("0", "Back")
         write("Select worker: ")
         local selected = tonumber(read())
         if not selected or selected == 0 then return end
@@ -1465,10 +1721,10 @@ local function backupsMenu()
     while true do
         term.clear(); term.setCursorPos(1, 1)
         print("CONTROLLER BACKUPS")
-        print("1) Create backup")
-        print("2) Restore backup")
-        print("3) List backups")
-        print("0) Back")
+        printMenuOption("1", "Create backup")
+        printMenuOption("2", "Restore backup")
+        printMenuOption("3", "List backups")
+        printMenuOption("0", "Back")
         write("Choose: ")
         local choice = read()
         if choice == "0" or choice == "" then return
@@ -1591,9 +1847,9 @@ end
 
 local function pairPocketUI()
     print("Permission role:")
-    print("1) Viewer (read only)")
-    print("2) Operator (jobs and worker controls)")
-    print("3) Administrator (updates, security, relocation, backups)")
+    printMenuOption("1", "Viewer - read only")
+    printMenuOption("2", "Operator - jobs and worker controls")
+    printMenuOption("3", "Administrator - updates, security, relocation, and backups")
     write("Role: ")
     local roles = { "viewer", "operator", "administrator" }
     local role = roles[tonumber(read())]
@@ -1629,10 +1885,10 @@ local function securityMenu()
         term.clear(); term.setCursorPos(1, 1)
         print("REMOTE SECURITY")
         print("Status: " .. (state.security.enabled and "enabled" or "disabled"))
-        print("1) Pair new pocket")
-        print("2) View / manage paired pockets")
-        print("3) " .. (state.security.enabled and "Disable" or "Enable") .. " remote control")
-        print("0) Back")
+        printMenuOption("1", "Pair new pocket")
+        printMenuOption("2", "View or manage paired pockets")
+        printMenuOption("3", (state.security.enabled and "Disable" or "Enable") .. " remote control")
+        printMenuOption("0", "Back")
         write("Choose: ")
         local choice = read()
         if choice == "0" or choice == "" then return
@@ -1645,12 +1901,18 @@ local function securityMenu()
                 write("Select pocket (0 back): ")
                 local pocket = pockets[tonumber(read())]
                 if pocket then
-                    print("1) Rename  2) Change role  3) Revoke  0) Back")
+                    printMenuOption("1", "Rename pocket")
+                    printMenuOption("2", "Change permission role")
+                    printMenuOption("3", "Revoke pocket")
+                    printMenuOption("0", "Back")
                     write("Choose: ")
                     local action = read()
                     if action == "1" then write("New name: "); pocket.name = read(); saveState()
                     elseif action == "2" then
-                        print("1 viewer  2 operator  3 administrator"); write("Role: ")
+                        printMenuOption("1", "Viewer")
+                        printMenuOption("2", "Operator")
+                        printMenuOption("3", "Administrator")
+                        write("Role: ")
                         local role = ({ "viewer", "operator", "administrator" })[tonumber(read())]
                         if role then pocket.role = role; saveState() end
                     elseif action == "3" then
@@ -1815,29 +2077,31 @@ local function operationsMenu()
             print("No active or recorded job.")
         end
         print("")
-        print("1  Pause hive")
-        print("2  Resume hive")
-        print("3  Safe abort")
-        print("4  Safe update hive")
-        print("0  Back")
+        printMenuOption("1", "Pause hive")
+        printMenuOption("2", "Resume hive")
+        printMenuOption("3", "Safe abort")
+        printMenuOption("4", "Safe update hive")
+        printMenuOption("5", "Emergency surface recovery")
+        printMenuOption("0", "Back")
         local choice = waitForMenuChoice()
         if choice == "0" then return
         elseif choice == "1" then pauseJob()
         elseif choice == "2" then resumeJob()
         elseif choice == "3" then abortJob()
-        elseif choice == "4" then updateHive() end
+        elseif choice == "4" then updateHive()
+        elseif choice == "5" then emergencySurfaceRecoveryUI() end
     end
 end
 
 local function jobsAndMapsMenu()
     while true do
         menuHeader("JOBS & MAPS")
-        print("1  Start quarry job")
-        print("2  Optional one-layer test")
-        print("3  Calibrate new map")
-        print("4  View saved maps")
-        print("5  Import legacy map")
-        print("0  Back")
+        printMenuOption("1", "Start quarry job")
+        printMenuOption("2", "Optional one-layer test")
+        printMenuOption("3", "Calibrate new map")
+        printMenuOption("4", "View saved maps")
+        printMenuOption("5", "Import legacy map")
+        printMenuOption("0", "Back")
         local choice = waitForMenuChoice()
         if choice == "0" then return
         elseif choice == "1" then startJob()
@@ -1851,10 +2115,10 @@ end
 local function maintenanceMenu()
     while true do
         menuHeader("MAINTENANCE")
-        print("1  Detect docks")
-        print("2  Relocate hive")
-        print("3  Backups")
-        print("0  Back")
+        printMenuOption("1", "Detect docks")
+        printMenuOption("2", "Relocate hive")
+        printMenuOption("3", "Backups")
+        printMenuOption("0", "Back")
         local choice = waitForMenuChoice()
         if choice == "0" then return
         elseif choice == "1" then detectDocks()
@@ -1866,9 +2130,9 @@ end
 local function logsAndHistoryMenu()
     while true do
         menuHeader("LOGS & HISTORY")
-        print("1  Event logs")
-        print("2  Job history")
-        print("0  Back")
+        printMenuOption("1", "Event logs")
+        printMenuOption("2", "Job history")
+        printMenuOption("0", "Back")
         local choice = waitForMenuChoice()
         if choice == "0" then return
         elseif choice == "1" then logsView()
@@ -1918,6 +2182,7 @@ local function remoteStatus()
         fuelLock = state.fuelLock,
         relocationMode = state.relocationMode,
         safeUpdate = state.safeUpdate,
+        emergencyRecovery = state.emergencyRecovery,
         preflight = state.preflight and {
             id = state.preflight.id,
             mapName = state.preflight.mapName,
@@ -1936,6 +2201,7 @@ local ACTION_RANK = {
     preflight_status = 1, safe_update_status = 1,
     preflight = 2, start_job = 2, pause_hive = 2, resume_hive = 2,
     abort_hive = 2, worker_action = 2,
+    emergency_surface_hive = 3,
     safe_update_prepare = 3, safe_update_commit = 3, safe_update_cancel = 3,
     relocate = 3, backup_create = 3, backup_list = 3, backup_restore = 3,
     security_list = 3, security_rename = 3, security_set_role = 3, security_revoke = 3,
@@ -1953,6 +2219,15 @@ local function workerActionFromRemote(params)
     elseif action == "recover_checkpoint" then
         if worker.positionConfidence ~= "recoverable" then return false, "Worker is not at a recoverable anchor." end
         send(worker.id, "recover_checkpoint", {}); return true
+    elseif action == "emergency_surface" then
+        send(worker.id, "emergency_surface", {
+            recoveryId = tostring(nowUtc()),
+            targetY = -1,
+        })
+        worker.status = "emergency_surfacing"
+        worker.error = nil
+        saveState()
+        return true
     elseif action == "recover_retry" or action == "restart" then
         local assignment, err = assignmentForWorker(worker)
         if not assignment then return false, err end
@@ -2112,6 +2387,7 @@ local function executeRemoteAction(sender, paired, action, params)
     elseif action == "pause_hive" then pauseJob(); return true
     elseif action == "resume_hive" then resumeJob(); return true
     elseif action == "abort_hive" then initiateAbortWithoutPrompt(); return true
+    elseif action == "emergency_surface_hive" then return beginEmergencySurfaceRecovery(sender)
     elseif action == "worker_action" then return workerActionFromRemote(params)
     elseif action == "safe_update_prepare" then return beginSafeUpdate(sender)
     elseif action == "safe_update_commit" then return commitSafeUpdate(sender)

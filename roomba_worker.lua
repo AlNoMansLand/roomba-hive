@@ -1,7 +1,7 @@
--- Roomba Hive Worker v0.3.2
+-- Roomba Hive Worker v0.3.4
 -- Requires a mining turtle with a wireless or ender modem.
 
-local VERSION = "0.3.2"
+local VERSION = "0.3.4"
 local PROTOCOL_VERSION = 2
 local PROTOCOL = "roomba_hive_worker_v2"
 local LEGACY_PROTOCOL = "roomba_hive_v1"
@@ -24,6 +24,7 @@ local INVENTORY_CHECK_INTERVAL = 6
 local MOVE_RETRY_DELAY = 0.4
 local ABORT_SIGNAL = "__ROOMBA_ABORT__"
 local FUEL_STATION_EMPTY_SIGNAL = "__ROOMBA_FUEL_STATION_EMPTY__"
+local EMERGENCY_SURFACE_SIGNAL = "__ROOMBA_EMERGENCY_SURFACE__"
 
 local NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
 local dirNames = { [NORTH] = "north", [EAST] = "east", [SOUTH] = "south", [WEST] = "west" }
@@ -104,6 +105,13 @@ end
 if atDockCoordinates() then
     state.positionConfidence = "confirmed"
     state.recoveryAnchor = "dock"
+elseif type(state.emergencySurface) == "table" and pos.y <= -1 then
+    state.positionConfidence = "recoverable"
+    state.recoveryAnchor = "surface_column"
+    state.status = "surface_recovery_paused"
+    state.error = pos.y < -1
+        and "Emergency vertical recovery was interrupted. Send Emergency surface recovery again to continue."
+        or "Emergency vertical recovery reached Y=-1. Retrieve and reposition this turtle, then Detect docks."
 elseif state.jobId then
     if state.positionConfidence == "recoverable" and state.recoveryAnchor == "center"
         and pos.y < 0 and pos.x == 0 and pos.z == 0 then
@@ -113,7 +121,7 @@ elseif state.jobId then
         state.positionConfidence = "unknown"
         state.recoveryAnchor = nil
         state.status = "recovery_required"
-        state.error = "Worker rebooted during movement. Return it to a dock manually, then Detect docks."
+        state.error = "Worker rebooted during movement. Use Emergency surface recovery or return it to a dock manually."
     end
 end
 
@@ -138,6 +146,7 @@ local parkRequested = false
 local taskActive = false
 local fuelLockGranted = false
 local fuelLockHeld = false
+local emergencySurfaceRequest = nil
 
 local uiMessage = "Starting worker"
 local lastUiRender = 0
@@ -174,6 +183,9 @@ local STATUS_LABELS = {
     tool_missing = "Mining tool missing",
     modem_missing = "Wireless modem missing",
     incompatible = "Incompatible controller protocol",
+    emergency_surfacing = "Emergency vertical recovery",
+    surface_recovered = "Recovered at controller Y-1",
+    surface_recovery_paused = "Vertical recovery paused",
 }
 
 local function trimLine(value, width)
@@ -638,7 +650,7 @@ local function ensureFuel(amount)
     end
 end
 
-local function ensureEmergencyFuel(amount)
+local function ensureEmergencyFuel(amount, message)
     if isUnlimitedFuel() then return end
     validateFuelSlot()
     turtle.select(FUEL_SLOT)
@@ -646,7 +658,7 @@ local function ensureEmergencyFuel(amount)
         if not turtle.refuel(1) then break end
     end
     if fuelLevel() < amount then
-        reportError("Insufficient emergency fuel to leave the fuel station.")
+        reportError(message or "Insufficient emergency fuel for the requested recovery movement.")
     end
 end
 
@@ -732,6 +744,7 @@ local function waitForComputerCraftObstruction(inspectFunction, description, res
     })
 
     while true do
+        if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
         if abortRequested then error(ABORT_SIGNAL, 0) end
         occupied, data = inspectFunction()
         if not occupied then break end
@@ -816,6 +829,59 @@ local function forwardMine()
     reportError("Too many falling blocks prevented movement.")
 end
 
+local function forwardClearSafe(description)
+    ensureFuel(1)
+    markMovementUnsafe()
+
+    for _ = 1, MAX_FALLING_DIGS do
+        local occupied, data = turtle.inspect()
+
+        if occupied and isLavaBlock(data) then
+            reportError("Lava detected " .. tostring(description or "in the route") .. ". Worker stopped before entering it.", {
+                block = data and data.name,
+            })
+        end
+
+        if occupied and isComputerCraftBlock(data) then
+            waitForComputerCraftObstruction(turtle.inspect, description or "in front", state.status)
+            return forwardClearSafe(description)
+        end
+
+        if not occupied or isWaterBlock(data) then
+            if turtle.forward() then
+                advancePosition()
+                return true
+            end
+            local moved, reason = entityBlockedForward()
+            if moved then return true end
+            return false, reason or "entity obstruction"
+        end
+
+        if protectedBlock(data) or (peripheral.hasType and peripheral.hasType("front", "inventory")) then
+            reportError("Protected block or inventory " .. tostring(description or "in the route") .. ": " .. tostring(data and data.name))
+        end
+
+        if not selectCollectionSlot() then
+            reportError("Storage slots 2-16 are full while clearing " .. tostring(description or "the route") .. ".")
+        end
+
+        local dug, reason = turtle.dig()
+        if not dug then
+            reportError("Cannot clear " .. tostring(description or "the route") .. ": " .. tostring(reason), {
+                block = data and data.name,
+            })
+        end
+
+        if turtle.forward() then
+            advancePosition()
+            return true
+        end
+        sleep(MOVE_RETRY_DELAY)
+    end
+
+    reportError("Too many falling blocks prevented clearing " .. tostring(description or "the route") .. ".")
+end
+
 local function upOpen()
     ensureFuel(1)
     markMovementUnsafe()
@@ -837,6 +903,77 @@ local function upOpen()
     sleep(MOVE_RETRY_DELAY)
     if turtle.up() then pos.y = pos.y + 1; markMoved(); return end
     reportError("Cannot ascend after waiting and attacking once.")
+end
+
+local function emergencyUpMine()
+    ensureEmergencyFuel(1, "Insufficient fuel to continue emergency vertical recovery.")
+    markMovementUnsafe()
+
+    for _ = 1, MAX_FALLING_DIGS do
+        local occupied, data = turtle.inspectUp()
+
+        if occupied and isLavaBlock(data) then
+            reportError("Emergency recovery stopped because lava is directly above the turtle.", {
+                block = data and data.name,
+            })
+        end
+
+        if occupied and (isComputerCraftBlock(data)
+            or protectedBlock(data)
+            or (peripheral.hasType and peripheral.hasType("top", "inventory"))) then
+            reportError("Emergency recovery stopped below a protected block or inventory: " .. tostring(data and data.name))
+        end
+
+        if not occupied or isWaterBlock(data) then
+            if turtle.up() then
+                pos.y = pos.y + 1
+                markMoved()
+                persist(true)
+                return
+            end
+
+            sleep(5)
+            if turtle.up() then
+                pos.y = pos.y + 1
+                markMoved()
+                persist(true)
+                return
+            end
+
+            turtle.attackUp()
+            sleep(MOVE_RETRY_DELAY)
+            if turtle.up() then
+                pos.y = pos.y + 1
+                markMoved()
+                persist(true)
+                return
+            end
+
+            reportError("Emergency recovery could not move upward after waiting and attacking once.")
+        end
+
+        if not selectCollectionSlot() then
+            reportError("Storage slots 2-16 are full during emergency vertical recovery.")
+        end
+
+        local dug, reason = turtle.digUp()
+        if not dug then
+            reportError("Emergency recovery could not mine the block above: " .. tostring(reason), {
+                block = data and data.name,
+            })
+        end
+
+        if turtle.up() then
+            pos.y = pos.y + 1
+            markMoved()
+            persist(true)
+            return
+        end
+
+        sleep(MOVE_RETRY_DELAY)
+    end
+
+    reportError("Too many falling blocks prevented emergency vertical recovery.")
 end
 
 local function downOpen()
@@ -1033,15 +1170,13 @@ end
 local function enterCenterFromDockAtCurrentY()
     local info = dockInfo[dock]
     turnTo(info.inward)
-    local moved, reason = forwardOpen()
-    if not moved then reportError("Cannot enter center from shaft: " .. tostring(reason)) end
+    forwardClearSafe("in the central column below the controller")
 end
 
 local function leaveCenterToShaft()
     local info = dockInfo[dock]
     turnTo(info.out)
-    local moved, reason = forwardOpen()
-    if not moved then reportError("Cannot return to dock shaft: " .. tostring(reason)) end
+    forwardClearSafe("between the central column and the assigned dock shaft")
 end
 
 local function ascendDock()
@@ -1126,6 +1261,9 @@ local function applyTaskMessage(message)
         abortRequested = true
         parkRequested = true
         paused = false
+    elseif message.type == "emergency_surface" then
+        emergencySurfaceRequest = message
+        paused = false
     end
 end
 
@@ -1152,15 +1290,18 @@ local function taskHeartbeat()
 end
 
 local function safePoint(resumeStatus)
+    if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
     if abortRequested then error(ABORT_SIGNAL, 0) end
     if paused then
         setStatus("paused")
         while paused do
+            if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
             if abortRequested then error(ABORT_SIGNAL, 0) end
             sleep(0.2)
         end
         setStatus(resumeStatus or "working")
     end
+    if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
     if abortRequested then error(ABORT_SIGNAL, 0) end
 end
 
@@ -1169,6 +1310,7 @@ local function requestFuelLock()
     setStatus("waiting_fuel_lock", "Waiting for another turtle to leave the fuel station")
     local lastRequest = 0
     while not fuelLockGranted do
+        if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
         if abortRequested then return false end
         local now = os.epoch("utc")
         if now - lastRequest >= 2000 then
@@ -1237,6 +1379,7 @@ local function refuelAtStation(required)
     local target = math.max(required or 0, FUEL_TARGET)
 
     while not abortRequested do
+        if emergencySurfaceRequest then error(EMERGENCY_SURFACE_SIGNAL, 0) end
         while fuelLevel() < target and turtle.getItemCount(FUEL_SLOT) > FUEL_ITEM_RESERVE do
             if not turtle.refuel(1) then
                 releaseFuelLock()
@@ -1543,6 +1686,119 @@ local function performAbort(note, messageType)
         note = note or (unloaded and "returned and unloaded" or "returned; output chest was full"),
         position = pos,
     })
+end
+
+
+local function clearJobForEmergencySurface()
+    state.jobId = nil
+    state.firstLayer = nil
+    state.lastLayer = nil
+    state.layer = nil
+    state.progress = nil
+    state.total = nil
+    state.checkpoint = nil
+    state.assignment = nil
+    state.jobMap = nil
+end
+
+local function performEmergencySurface(message)
+    message = message or emergencySurfaceRequest or {}
+    emergencySurfaceRequest = nil
+    paused = false
+    abortRequested = false
+    parkRequested = false
+    releaseFuelLock()
+
+    local recoveryId = message.recoveryId or tostring(os.epoch("utc"))
+    local targetY = tonumber(message.targetY) or -1
+    if targetY ~= -1 then targetY = -1 end
+
+    send("worker_surface_started", {
+        recoveryId = recoveryId,
+        position = pos,
+        targetY = targetY,
+    })
+
+    if pos.y > 0 then
+        setStatus("recovering", "Leaving the elevated fuel route before emergency recovery")
+        recoverToDockAndUnload()
+        clearJobState()
+        setStatus("docked", "Already recovered safely at the dock")
+        send("worker_surface_recovered", {
+            recoveryId = recoveryId,
+            position = pos,
+            note = "Worker was above controller level and returned to its dock.",
+            alreadyDocked = true,
+        })
+        return
+    end
+
+    if pos.y == 0 and atDockCoordinates() then
+        clearJobState()
+        setStatus("docked", "Already safely docked")
+        send("worker_surface_recovered", {
+            recoveryId = recoveryId,
+            position = pos,
+            note = "Worker was already docked.",
+            alreadyDocked = true,
+        })
+        return
+    end
+
+    state.emergencySurface = {
+        recoveryId = recoveryId,
+        targetY = targetY,
+        startedAt = os.epoch("utc"),
+    }
+    state.positionConfidence = "recoverable"
+    state.recoveryAnchor = "surface_column"
+    state.error = nil
+    persist(true)
+
+    if pos.y < targetY then
+        local movesRequired = targetY - pos.y
+        ensureEmergencyFuel(
+            movesRequired + 2,
+            "Insufficient fuel to rise " .. tostring(movesRequired) .. " block(s) during emergency recovery."
+        )
+        setStatus("emergency_surfacing", "Mining straight upward to controller Y-1")
+
+        while pos.y < targetY do
+            emergencyUpMine()
+            state.positionConfidence = "recoverable"
+            state.recoveryAnchor = "surface_column"
+            state.emergencySurface.lastY = pos.y
+            persist(true)
+            send("worker_surface_progress", {
+                recoveryId = recoveryId,
+                position = pos,
+                targetY = targetY,
+                remaining = targetY - pos.y,
+            })
+        end
+    end
+
+    clearJobForEmergencySurface()
+    state.positionConfidence = "recoverable"
+    state.recoveryAnchor = "surface_column"
+    state.emergencySurface = nil
+    state.error = "Emergency surface recovery complete. Retrieve or reposition this turtle, then run Detect docks."
+    setStatus("surface_recovered", "Reached one block below controller level")
+    send("worker_surface_recovered", {
+        recoveryId = recoveryId,
+        position = pos,
+        note = "Reached logical Y=-1 by mining straight upward.",
+        storedItems = select(2, storageSummary()),
+    })
+end
+
+local function handleEmergencySurfaceFailure(err)
+    if err ~= EMERGENCY_SURFACE_SIGNAL then return false end
+    local request = emergencySurfaceRequest or {}
+    emergencySurfaceRequest = nil
+    local ok, recoveryError = pcall(function() performEmergencySurface(request) end)
+    if not ok then printError(recoveryError) end
+    return true
 end
 
 
@@ -1873,7 +2129,9 @@ local function commandLoop()
                     fuelLockGranted = false
                     local ok, err = runManagedTask(function() runSectionWork(message) end)
                     if not ok then
-                        if err == FUEL_STATION_EMPTY_SIGNAL then
+                        if handleEmergencySurfaceFailure(err) then
+                            -- Emergency vertical recovery handled the interrupted task.
+                        elseif err == FUEL_STATION_EMPTY_SIGNAL then
                             -- The worker is already safely docked and waiting for restock.
                         elseif err == ABORT_SIGNAL then
                             local messageType = parkRequested and "worker_parked" or "worker_aborted"
@@ -1911,7 +2169,9 @@ local function commandLoop()
                 else
                     local ok, err = runManagedTask(function() recoverAndRetry(message) end)
                     if not ok then
-                        if err == FUEL_STATION_EMPTY_SIGNAL then
+                        if handleEmergencySurfaceFailure(err) then
+                            -- Emergency vertical recovery handled the interrupted task.
+                        elseif err == FUEL_STATION_EMPTY_SIGNAL then
                             -- The worker is already safely docked and waiting for restock.
                         elseif err == ABORT_SIGNAL then
                             local messageType = parkRequested and "worker_parked" or "worker_aborted"
@@ -1922,6 +2182,11 @@ local function commandLoop()
                         end
                     end
                 end
+
+            elseif message.type == "emergency_surface" then
+                setActivity("Emergency vertical recovery command received")
+                local ok, err = runManagedTask(function() performEmergencySurface(message) end)
+                if not ok then printError(err) end
 
             elseif message.type == "preflight_request" then
                 send("preflight_response", buildPreflightReport(message.requestId))
